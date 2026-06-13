@@ -78,6 +78,16 @@ app.get('/api/predict', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /api/train — trigger a full retrain (admin only, runs in background)
+// ---------------------------------------------------------------------------
+app.post('/api/train', requireAdmin, (req, res) => {
+  const { train } = require('./src/train');
+  const seasons = [2021, 2022, 2023, 2024, 2025, 2026];
+  res.json({ started: true, message: 'Training started — check server logs for progress' });
+  train({ seasons, fresh: false }).catch(err => console.error('[train]', err.message));
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/update — run the update script
 // ---------------------------------------------------------------------------
 app.post('/api/update', requireAdmin, async (req, res) => {
