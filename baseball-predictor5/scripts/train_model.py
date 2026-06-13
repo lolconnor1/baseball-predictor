@@ -92,15 +92,20 @@ def export_xgb_tree(tree_json_str):
 # Helpers
 # ---------------------------------------------------------------------------
 
+import os
+N_TREES   = int(os.environ.get("N_TREES",   "200"))
+MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "12"))
+SKIP_XGB  = os.environ.get("SKIP_XGB", "").lower() in ("1", "true", "yes")
+
 def make_rf():
     return RandomForestClassifier(
-        n_estimators=200, max_depth=12, min_samples_leaf=15,
+        n_estimators=N_TREES, max_depth=MAX_DEPTH, min_samples_leaf=15,
         random_state=42, n_jobs=-1,
     )
 
 def make_xgb():
     return xgb.XGBClassifier(
-        n_estimators=400, max_depth=6, learning_rate=0.05,
+        n_estimators=min(N_TREES * 2, 400), max_depth=6, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
         min_child_weight=15, gamma=1,
         objective="binary:logistic", eval_metric="logloss",
@@ -159,6 +164,7 @@ def main():
     baseline = float(y_test.mean())
 
     print(f"   Train: {len(y_train)}  Test: {len(y_test)}", flush=True)
+    print(f"   Config: {N_TREES} trees, depth {MAX_DEPTH}, skip_xgb={SKIP_XGB}", flush=True)
 
     # -- Phase 1: compare RF vs XGBoost on temporal hold-out ----------------
     print("   Phase 1: training RF...", flush=True)
@@ -167,15 +173,22 @@ def main():
     rf_acc = accuracy(rf, X_test, y_test)
     print(f"   RF  test accuracy: {rf_acc*100:.1f}%", flush=True)
 
-    print("   Phase 1: training XGBoost...", flush=True)
-    xgb_clf = make_xgb()
-    xgb_clf.fit(X_train, y_train)
-    xgb_acc = accuracy(xgb_clf, X_test, y_test)
-    print(f"   XGB test accuracy: {xgb_acc*100:.1f}%", flush=True)
+    if SKIP_XGB:
+        use_xgb     = False
+        best_acc    = rf_acc
+        winner_name = "RandomForest"
+        xgb_clf     = None
+        print(f"   Skipping XGBoost (SKIP_XGB=true)", flush=True)
+    else:
+        print("   Phase 1: training XGBoost...", flush=True)
+        xgb_clf = make_xgb()
+        xgb_clf.fit(X_train, y_train)
+        xgb_acc = accuracy(xgb_clf, X_test, y_test)
+        print(f"   XGB test accuracy: {xgb_acc*100:.1f}%", flush=True)
+        use_xgb     = xgb_acc > rf_acc
+        best_acc    = xgb_acc if use_xgb else rf_acc
+        winner_name = "XGBoost" if use_xgb else "RandomForest"
 
-    use_xgb     = xgb_acc > rf_acc
-    best_acc    = xgb_acc if use_xgb else rf_acc
-    winner_name = "XGBoost" if use_xgb else "RandomForest"
     print(f"   Winner: {winner_name}  ({best_acc*100:.1f}% vs {baseline*100:.1f}% baseline)", flush=True)
 
     # -- Platt scaling calibration on the temporal hold-out ---------------
