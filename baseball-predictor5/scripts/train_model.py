@@ -95,12 +95,14 @@ def export_xgb_tree(tree_json_str):
 import os
 N_TREES   = int(os.environ.get("N_TREES",   "200"))
 MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "12"))
+N_JOBS    = int(os.environ.get("N_JOBS",    "-1"))
 SKIP_XGB  = os.environ.get("SKIP_XGB", "").lower() in ("1", "true", "yes")
+SKIP_CV   = os.environ.get("SKIP_CV",  "").lower() in ("1", "true", "yes")
 
 def make_rf():
     return RandomForestClassifier(
         n_estimators=N_TREES, max_depth=MAX_DEPTH, min_samples_leaf=15,
-        random_state=42, n_jobs=-1,
+        random_state=42, n_jobs=N_JOBS,
     )
 
 def make_xgb():
@@ -109,7 +111,7 @@ def make_xgb():
         subsample=0.8, colsample_bytree=0.8,
         min_child_weight=15, gamma=1,
         objective="binary:logistic", eval_metric="logloss",
-        base_score=0.5, random_state=42, n_jobs=-1,
+        base_score=0.5, random_state=42, n_jobs=N_JOBS,
         verbosity=0,
     )
 
@@ -200,7 +202,7 @@ def main():
     print(f"   Calibration: a={cal_a:.3f}, b={cal_b:.3f}\n", flush=True)
 
     # -- Walk-forward CV using the winning model type -----------------------
-    if dates:
+    if dates and not SKIP_CV:
         make_winner = make_xgb if use_xgb else make_rf
         print("   Walk-forward CV by year:", flush=True)
         wf = walk_forward_cv(X, y, dates, make_winner)
@@ -209,6 +211,8 @@ def main():
         print("", flush=True)
     else:
         wf = {}
+        if SKIP_CV:
+            print("   Walk-forward CV skipped (SKIP_CV=true)", flush=True)
 
     # -- Phase 2: retrain winner on full dataset ----------------------------
     print(f"   Phase 2: retraining {winner_name} on full dataset ({len(y)} examples)...", flush=True)
