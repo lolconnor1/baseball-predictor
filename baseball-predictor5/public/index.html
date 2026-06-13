@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>⚾ Baseball Oracle</title>
+  <meta name="theme-color" content="#0a0e0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Oracle">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="scanlines"></div>
+
+  <header>
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">⚾</span>
+        <div class="logo-text">
+          <span class="logo-title">BASEBALL ORACLE</span>
+          <span class="logo-sub">MLB PREDICTIONS</span>
+        </div>
+      </div>
+      <div class="model-status" id="modelStatus">
+        <span class="status-dot"></span>
+        <span class="status-text">Loading…</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Desktop top tabs (hidden on mobile) -->
+  <nav class="tabs">
+    <button class="tab active" data-tab="predictions">Predictions</button>
+    <button class="tab" data-tab="accuracy">Accuracy Log</button>
+    <button class="tab" data-tab="bets">Bet Tracker</button>
+    <button class="tab" data-tab="model">Oracle</button>
+  </nav>
+
+  <!-- ── PREDICTIONS TAB ── -->
+  <section class="tab-content active" id="tab-predictions">
+    <div class="toolbar">
+      <div class="date-control">
+        <label for="datePicker">DATE</label>
+        <input type="date" id="datePicker">
+      </div>
+      <button class="btn-primary" id="btnPredict">RUN PREDICTIONS</button>
+      <button class="btn-secondary" id="btnUpdate">UPDATE MODEL</button>
+    </div>
+
+    <div id="predictionsContainer">
+      <div class="empty-state">
+        <div class="empty-icon">⚾</div>
+        <p>Select a date and click RUN PREDICTIONS</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── ACCURACY TAB ── -->
+  <section class="tab-content" id="tab-accuracy">
+    <div class="accuracy-header">
+      <div class="stat-cards" id="statCards">
+        <div class="stat-card">
+          <div class="stat-label">ALL-TIME</div>
+          <div class="stat-value" id="statAllTime">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">LAST 30 DAYS</div>
+          <div class="stat-value" id="statRecent">—</div>
+        </div>
+        <div class="stat-card highlight">
+          <div class="stat-label">HIGH CONFIDENCE (≥65%)</div>
+          <div class="stat-value" id="statConf">—</div>
+        </div>
+      </div>
+    </div>
+    <div id="accuracyLog">
+      <div class="empty-state">
+        <div class="empty-icon">📊</div>
+        <p>No accuracy data yet — run an update after games finish</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── BET TRACKER TAB ── -->
+  <section class="tab-content" id="tab-bets">
+    <div class="bet-stat-cards" id="betStatCards">
+      <div class="bet-stat-card">
+        <div class="stat-label">NET P&amp;L</div>
+        <div class="stat-value" id="betStatPnl">—</div>
+      </div>
+      <div class="bet-stat-card">
+        <div class="stat-label">WIN RATE</div>
+        <div class="stat-value" id="betStatWinRate">—</div>
+      </div>
+      <div class="bet-stat-card">
+        <div class="stat-label">TOTAL WAGERED</div>
+        <div class="stat-value" id="betStatWagered">—</div>
+      </div>
+      <div class="bet-stat-card">
+        <div class="stat-label">ROI</div>
+        <div class="stat-value" id="betStatRoi">—</div>
+      </div>
+    </div>
+    <div id="betsLog">
+      <div class="empty-state">
+        <div class="empty-icon">💰</div>
+        <p>No bets logged yet — click LOG BET on any prediction card</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── MODEL / ORACLE TAB ── -->
+  <section class="tab-content" id="tab-model">
+    <div class="model-info" id="modelInfo">
+      <div class="empty-state">
+        <div class="empty-icon">🔮</div>
+        <p>Loading model info…</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Mobile bottom navigation bar -->
+  <nav class="bottom-nav">
+    <button class="nav-item active" data-tab="predictions">
+      <span class="nav-icon">⚾</span>
+      <span>Predictions</span>
+    </button>
+    <button class="nav-item" data-tab="accuracy">
+      <span class="nav-icon">📊</span>
+      <span>Accuracy</span>
+    </button>
+    <button class="nav-item" data-tab="bets">
+      <span class="nav-icon">💰</span>
+      <span>Bets</span>
+    </button>
+    <button class="nav-item" data-tab="model">
+      <span class="nav-icon">🔮</span>
+      <span>Oracle</span>
+    </button>
+  </nav>
+
+  <!-- Bet modal -->
+  <div class="modal-overlay" id="betModal">
+    <div class="modal bet-modal">
+      <div class="modal-title">LOG BET</div>
+      <div class="bet-modal-matchup" id="betModalMatchup"></div>
+
+      <div class="bet-team-btns" id="betTeamBtns"></div>
+
+      <div class="bet-form">
+        <div class="bet-form-group">
+          <label class="bet-form-label">ODDS (AMERICAN)</label>
+          <input type="number" id="betOddsInput" class="bet-input" placeholder="-110">
+        </div>
+        <div class="bet-form-group">
+          <label class="bet-form-label">AMOUNT ($)</label>
+          <input type="number" id="betAmountInput" class="bet-input" placeholder="100" min="1" step="1">
+        </div>
+      </div>
+
+      <div class="bet-payout-preview" id="betPayoutPreview"></div>
+
+      <div class="bet-modal-actions">
+        <button class="btn-secondary" id="betCancelBtn">CANCEL</button>
+        <button class="btn-primary" id="betSubmitBtn">LOG BET</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Update modal -->
+  <div class="modal-overlay" id="updateModal">
+    <div class="modal">
+      <div class="modal-title">UPDATING MODEL</div>
+      <div class="modal-spinner">⚙</div>
+      <div class="modal-log" id="updateLog">Fetching new games…</div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>

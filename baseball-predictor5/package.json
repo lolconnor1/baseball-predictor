@@ -1,0 +1,25 @@
+{
+  "name": "baseball-predictor",
+  "version": "2.0.0",
+  "description": "MLB win/loss predictor using neural networks and the free MLB Stats API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "train": "node index.js train",
+    "update": "node index.js update",
+    "predict": "node index.js predict"
+  },
+  "dependencies": {
+    "brain.js": "1.6.0",
+    "commander": "^12.0.0",
+    "express": "^4.22.1",
+    "ml-random-forest": "^2.1.0",
+    "node-cron": "^4.2.1",
+    "playwright": "^1.59.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
