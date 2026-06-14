@@ -324,8 +324,12 @@ async function train({ seasons = [2021, 2022, 2023, 2024, 2025, 2026], fresh = f
 
   fs.unlinkSync(TMP_IN);
 
-  if (result.status !== 0) {
-    throw new Error(`Python trainer exited with code ${result.status}`);
+  if (result.status !== 0 || result.signal) {
+    const detail = result.signal
+      ? `killed by signal ${result.signal} (${result.signal === 'SIGKILL' ? 'likely OOM' : 'terminated'})`
+      : `exit code ${result.status}`;
+    if (result.stderr) console.error('Python stderr:', result.stderr.toString());
+    throw new Error(`Python trainer failed — ${detail}`);
   }
 
   const pyOut       = JSON.parse(fs.readFileSync(TMP_OUT, 'utf8'));

@@ -78,6 +78,32 @@ app.get('/api/predict', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/python-check — verify Python + packages are available (admin only)
+// ---------------------------------------------------------------------------
+app.get('/api/python-check', requireAdmin, (req, res) => {
+  const { spawnSync } = require('child_process');
+  const pythonCmd = process.env.PYTHON_CMD ?? (process.platform === 'win32' ? 'python' : 'python3');
+  const result = spawnSync(pythonCmd, ['-c', `
+import sys, platform
+print("python:", sys.version)
+print("platform:", platform.platform())
+import numpy; print("numpy:", numpy.__version__)
+import sklearn; print("sklearn:", sklearn.__version__)
+import xgboost; print("xgboost:", xgboost.__version__)
+print("OK")
+`], { timeout: 15000, env: { ...process.env } });
+
+  res.json({
+    cmd:    pythonCmd,
+    status: result.status,
+    signal: result.signal ?? null,
+    stdout: result.stdout?.toString().trim() ?? '',
+    stderr: result.stderr?.toString().trim() ?? '',
+    ok:     result.status === 0 && !result.signal,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/train — trigger a full retrain (admin only, runs in background)
 // ---------------------------------------------------------------------------
 app.post('/api/train', requireAdmin, (req, res) => {
