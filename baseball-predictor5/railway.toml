@@ -1,7 +1,7 @@
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
+dockerfilePath = "baseball-predictor5/Dockerfile"
 
 [deploy]
-startCommand = "npm start"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
