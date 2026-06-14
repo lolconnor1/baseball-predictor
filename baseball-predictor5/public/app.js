@@ -245,34 +245,6 @@ function buildGameCard(game) {
 }
 
 // ---------------------------------------------------------------------------
-// Update
-// ---------------------------------------------------------------------------
-
-document.getElementById('btnUpdate').addEventListener('click', async () => {
-  const modal  = document.getElementById('updateModal');
-  const logEl  = document.getElementById('updateLog');
-  const btn    = document.getElementById('btnUpdate');
-
-  modal.classList.add('active');
-  logEl.textContent = 'Starting update…\n';
-  btn.disabled = true;
-
-  try {
-    const data = await api('/api/update', { method: 'POST' });
-    logEl.textContent = (data.log || []).join('\n');
-    setTimeout(() => {
-      modal.classList.remove('active');
-      loadStatus();
-    }, 2000);
-  } catch (err) {
-    logEl.textContent = `Error: ${err.message}`;
-    setTimeout(() => modal.classList.remove('active'), 3000);
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-// ---------------------------------------------------------------------------
 // Accuracy log
 // ---------------------------------------------------------------------------
 
