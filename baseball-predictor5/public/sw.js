@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_NAME = 'baseball-oracle-v1';
+const CACHE_NAME = 'baseball-oracle-v2';
 const PRECACHE_URLS = ['/', '/index.html', '/app.js', '/style.css', '/manifest.json'];
 
 // Install: precache static assets
