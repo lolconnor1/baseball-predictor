@@ -141,84 +141,6 @@ async function fetchSeasonPitcherStats(season) {
 }
 
 // ---------------------------------------------------------------------------
-// NEW: Pitcher game logs for recent form backfill
-// Fetches last-N-start ERA for a list of pitcher IDs for a given season.
-// Returns Map<pitcherId, { recentEra, startDates: [date, ...] }>
-// ---------------------------------------------------------------------------
-
-async function fetchPitcherGameLogs(pitcherIds, season, lastNStarts = 3) {
-  if (!pitcherIds || pitcherIds.length === 0) return new Map();
-
-  // Batch into chunks of 50 to avoid URL length limits
-  const BATCH = 50;
-  const result = new Map();
-
-  for (let i = 0; i < pitcherIds.length; i += BATCH) {
-    const batch = pitcherIds.slice(i, i + BATCH);
-    const url =
-      `${BASE_URL}/people?personIds=${batch.join(',')}` +
-      `&hydrate=stats(group=pitching,type=gameLog,season=${season})`;
-
-    let data;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
-    } catch (err) {
-      console.warn(`   ⚠️  Game log batch fetch failed: ${err.message}`);
-      continue;
-    }
-
-    for (const person of data.people || []) {
-      const pitchHand = person.pitchHand?.code ?? 'R';
-
-      const gameLog = person.stats
-        ?.find(s => s.group?.displayName === 'pitching' && s.type?.displayName === 'gameLog');
-
-      const starts = (gameLog?.splits || [])
-        .filter(s => (s.stat?.gamesStarted ?? 0) >= 1 && parseFloat(s.stat?.inningsPitched) >= 1)
-        .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
-        .slice(0, lastNStarts);
-
-      if (starts.length === 0) {
-        // Still save handedness even without start data
-        result.set(person.id, { recentEra: null, startCount: 0, startDates: [], pitchHand });
-        continue;
-      }
-
-      // Compute earned runs and innings over last N starts for a true rolling ERA
-      let totalER = 0;
-      let totalIP = 0;
-
-      for (const s of starts) {
-        totalER  += s.stat.earnedRuns ?? 0;
-        totalIP  += parseFloat(s.stat.inningsPitched) || 0;
-      }
-
-      const recentEra = totalIP > 0 ? (totalER / totalIP) * 9 : null;
-
-      // Store per-start detail so features.js can filter by date at training time
-      const startDetail = starts.map(s => ({
-        date:        s.date,
-        earnedRuns:  s.stat?.earnedRuns ?? 0,
-        ip:          parseFloat(s.stat?.inningsPitched) || 0,
-      }));
-
-      result.set(person.id, {
-        recentEra,
-        startCount: starts.length,
-        startDates: startDetail,  // array of { date, earnedRuns, ip }
-        pitchHand,
-      });
-    }
-
-    await sleep(200);
-  }
-
-  return result;
-}
-
-// ---------------------------------------------------------------------------
 // NEW: Bullpen pitch counts from boxscores
 // Fetches the total relief pitcher pitches thrown by each team for a game.
 // Returns Map<gameId, { homeBullpenPitches, awayBullpenPitches }>
@@ -298,6 +220,7 @@ async function fetchGamesForDate(date) {
       games.push({
         gameId:        game.gamePk,
         date:          dateObj.date,
+        gameDate:      game.gameDate ?? null,   // first pitch, ISO UTC
         homeTeamId:    home.team.id,
         homeTeamName:  home.team.name,
         awayTeamId:    away.team.id,
@@ -315,43 +238,6 @@ async function fetchGamesForDate(date) {
   return games;
 }
 
-// ---------------------------------------------------------------------------
-// Bullpen quality ERA by team for a season
-// Returns Map<teamId, bullpenERA>
-// ---------------------------------------------------------------------------
-
-async function fetchBullpenERA(teamIds, season) {
-  if (!teamIds || teamIds.length === 0) return new Map();
-
-  const result = new Map();
-
-  for (const teamId of teamIds) {
-    const url =
-      `${BASE_URL}/teams/${teamId}/stats` +
-      `?stats=season&group=pitching&gameType=R&season=${season}&playerPool=relievers&sportId=1`;
-
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-
-      // Look for team-level aggregated ERA across relievers
-      const teamStat = (data.stats ?? [])
-        .flatMap(s => s.splits ?? [])
-        .find(s => s.stat?.era != null);
-
-      const era = teamStat ? parseFloat(teamStat.stat.era) : null;
-      if (era != null && !isNaN(era)) result.set(teamId, era);
-    } catch (err) {
-      console.warn(`  ⚠️  Bullpen ERA fetch failed for team ${teamId} ${season}: ${err.message}`);
-    }
-
-    await sleep(120);
-  }
-
-  return result;
-}
-
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -360,7 +246,5 @@ module.exports = {
   fetchHistoricalGames,
   fetchGamesForDate,
   fetchSeasonPitcherStats,
-  fetchPitcherGameLogs,
   fetchBullpenData,
-  fetchBullpenERA,
 };

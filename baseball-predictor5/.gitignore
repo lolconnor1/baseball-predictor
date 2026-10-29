@@ -1,8 +1,13 @@
 # Dependencies
 node_modules/
 
-# Runtime data — lives on Railway's persistent volume, not in git
-data/
+# Pipeline state in data/ IS committed (the daily GitHub Actions run updates
+# it). The model is rebuilt/cached in CI instead — it's large and changes daily.
+data/model.json
+data/_train_*.json
+
+# Generated website data (built by `node index.js publish`)
+public/data/
 
 # Python cache
 __pycache__/

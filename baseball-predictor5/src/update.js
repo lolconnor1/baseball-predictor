@@ -5,38 +5,30 @@ const fs    = require('fs');
 const path  = require('path');
 
 const { train }                                                 = require('./train');
-const { fetchSeasonPitcherStats, fetchPitcherGameLogs,
-        fetchBullpenData, fetchBullpenERA }                     = require('./api');
-const { fetchTeamSplits }                                       = require('./splits');
+const { fetchBullpenData }                                      = require('./api');
 const { fetchGameWeather }                                      = require('./weather');
 const { getVenueCoords }                                        = require('./venues');
-const { buildTeamHistory, computeTeamStats, computeH2HStats,
-        computeScheduleContext, buildUmpireHistory,
-        buildFeatureVector }                                        = require('./features');
+const { buildTeamHistory, buildUmpireHistory, buildGameFeatures } = require('./features');
+const { loadPitCache, ensureSeasonLogs, buildPitContext }       = require('./pointInTime');
 
 const ROOT             = path.join(__dirname, '..');
 const DATA_PATH        = path.join(ROOT, 'data', 'games.json');
-const STATS_PATH       = path.join(ROOT, 'data', 'pitcher-stats.json');
-const GAMELOGS_PATH    = path.join(ROOT, 'data', 'pitcher-gamelogs.json');
 const BULLPEN_PATH     = path.join(ROOT, 'data', 'bullpen.json');
 const MODEL_PATH       = path.join(ROOT, 'data', 'model.json');
 const LOG_PATH         = path.join(ROOT, 'data', 'accuracy-log.json');
 const WEATHER_PATH     = path.join(ROOT, 'data', 'weather-cache.json');
-const BULLPEN_ERA_PATH = path.join(ROOT, 'data', 'bullpen-era.json');
 const PRED_CACHE_PATH  = path.join(ROOT, 'data', 'prediction-cache.json');
-const CAL_PATH         = path.join(ROOT, 'data', 'calibration.json');
 
 // ---------------------------------------------------------------------------
 
 async function update() {
   // ── 1. Check prerequisites ─────────────────────────────────────────────
+  // Throw rather than exit — update() also runs inside the web server's cron
   if (!fs.existsSync(MODEL_PATH)) {
-    console.error('❌  No trained model found. Run `node index.js train` first.');
-    process.exit(1);
+    throw new Error('No trained model found. Run `node index.js train` first.');
   }
   if (!fs.existsSync(DATA_PATH)) {
-    console.error('❌  No game data found. Run `node index.js train` first.');
-    process.exit(1);
+    throw new Error('No game data found. Run `node index.js train` first.');
   }
 
   // ── 2. Find last cached game date ──────────────────────────────────────
@@ -45,8 +37,7 @@ async function update() {
   const today         = new Date().toISOString().split('T')[0];
 
   if (!lastDate) {
-    console.error('❌  Game cache is empty. Run `node index.js train` instead.');
-    process.exit(1);
+    throw new Error('Game cache is empty. Run `node index.js train` instead.');
   }
 
   // Always re-fetch from lastDate (not lastDate+1) so late-finishing games
@@ -79,174 +70,80 @@ async function update() {
   const allGames   = [...existingGames, ...newGames];
   const newSeasons = [...new Set(newGames.map(g => g.date.slice(0, 4)))];
 
-  // ── 4. Load cached pitcher stats — do NOT refresh yet ─────────────────────
-  // Refreshing before feature-building would contaminate the features with
-  // post-game ERA/WHIP, giving accuracy numbers that can't be reproduced
-  // from a real pre-game prediction. Stats are refreshed after training below.
-  let pitcherStatsBySeason = {};
-  if (fs.existsSync(STATS_PATH)) {
-    const raw = JSON.parse(fs.readFileSync(STATS_PATH, 'utf8'));
-    for (const [season, entries] of Object.entries(raw)) {
-      pitcherStatsBySeason[season] = new Map(entries);
-    }
-  }
-
   const payload = JSON.parse(fs.readFileSync(MODEL_PATH, 'utf8'));
 
   const normStats   = payload.normStats ?? null;
-  const calibration = fs.existsSync(CAL_PATH)
-    ? JSON.parse(fs.readFileSync(CAL_PATH, 'utf8'))
-    : null;
+  const calibration = payload.model?.calibration ?? null;
   const predCache = fs.existsSync(PRED_CACHE_PATH)
     ? JSON.parse(fs.readFileSync(PRED_CACHE_PATH, 'utf8'))
     : {};
 
-  // ── 5. Build feature vectors using EXISTING history (no leakage) ───────
-  // Important: we use existingGames (not allGames) to build the history so
-  // that predictions are made with only data available before each game.
+  // ── 4. Build feature vectors for games with no pre-game prediction ────
+  // Everything goes through buildGameFeatures, which only uses data from
+  // before each game's date, so refreshing the logs first doesn't leak.
   console.log('🔧  Building feature vectors…');
-  const history     = buildTeamHistory(existingGames);
+  const history       = buildTeamHistory(existingGames);
   const umpireHistory = buildUmpireHistory(existingGames);
 
-  // Load bullpen and game log caches
   let bullpenByGame = null;
   if (fs.existsSync(BULLPEN_PATH)) {
     const raw = JSON.parse(fs.readFileSync(BULLPEN_PATH, 'utf8'));
     bullpenByGame = new Map(Object.entries(raw).map(([k, v]) => [parseInt(k), v]));
   }
 
-  // Fetch batting splits for affected seasons (cached per team)
-  const splitsBySeason = {};
-  for (const season of newSeasons) {
-    splitsBySeason[season] = {};
-    const teamIds = [...new Set(newGames.filter(g => g.date.startsWith(season))
-      .flatMap(g => [g.homeTeamId, g.awayTeamId]))];
-    for (const teamId of teamIds) {
-      const splits = await fetchTeamSplits(teamId, season);
-      if (splits) splitsBySeason[season][teamId] = splits;
-    }
-  }
-
   // Fetch weather for new games (merge into persistent cache)
   const weatherByGame = fs.existsSync(WEATHER_PATH)
     ? JSON.parse(fs.readFileSync(WEATHER_PATH, 'utf8'))
     : {};
-  await Promise.all(newGames.map(async g => {
-    if (weatherByGame[g.gameId]) return;
-    const coords = getVenueCoords(g.homeTeamId);
-    if (!coords) return;
-    const w = await fetchGameWeather(coords.lat, coords.lon, g.date, g.homeTeamId);
-    if (w) weatherByGame[g.gameId] = w;
-  }));
+  // Batched so a large catch-up (e.g. after the off-season) doesn't flood the API
+  const needWeather = newGames.filter(g => !weatherByGame[g.gameId] && getVenueCoords(g.homeTeamId));
+  for (let i = 0; i < needWeather.length; i += 5) {
+    await Promise.all(needWeather.slice(i, i + 5).map(async g => {
+      const coords = getVenueCoords(g.homeTeamId);
+      const w = await fetchGameWeather(coords.lat, coords.lon, g.date, g.homeTeamId);
+      if (w) weatherByGame[g.gameId] = w;
+    }));
+    if (i + 5 < needWeather.length) await new Promise(r => setTimeout(r, 200));
+  }
   fs.writeFileSync(WEATHER_PATH, JSON.stringify(weatherByGame));
 
-  // Fetch bullpen quality ERA for affected seasons (merge into persistent cache)
-  const bullpenERABySeason = {};
-  if (fs.existsSync(BULLPEN_ERA_PATH)) {
-    const raw = JSON.parse(fs.readFileSync(BULLPEN_ERA_PATH, 'utf8'));
-    for (const [season, entries] of Object.entries(raw)) {
-      bullpenERABySeason[season] = new Map(entries);
-    }
+  const needsRebuild = newGames.some(g => predCache[`${g.date}|${g.gameId}`]?.homeProb == null);
+  let pit = null;
+  if (needsRebuild) {
+    const pitCache = loadPitCache();
+    await ensureSeasonLogs(pitCache, allGames, newSeasons);
+    pit = buildPitContext(pitCache);
   }
-  for (const season of newSeasons) {
-    const teamIds = [...new Set(newGames.filter(g => g.date.startsWith(season))
-      .flatMap(g => [g.homeTeamId, g.awayTeamId]))];
-    const freshMap = await fetchBullpenERA(teamIds, season);
-    if (!bullpenERABySeason[season]) bullpenERABySeason[season] = new Map();
-    for (const [id, era] of freshMap.entries()) bullpenERABySeason[season].set(id, era);
-  }
-  const bullpenERASer = {};
-  for (const [s, m] of Object.entries(bullpenERABySeason)) bullpenERASer[s] = [...m.entries()];
-  fs.writeFileSync(BULLPEN_ERA_PATH, JSON.stringify(bullpenERASer));
+  const featureCtx = { history, umpireHistory, pit, bullpenByGame, weatherByGame, normStats };
 
-  const predictions  = [];
-  let   skipped      = 0;
-  let   withPitchers = 0;
-  let   fromCache    = 0;
-
-  // Load game logs once outside the loop (avoid re-reading for every game)
-  const gameLogsRaw = fs.existsSync(GAMELOGS_PATH)
-    ? JSON.parse(fs.readFileSync(GAMELOGS_PATH, 'utf8'))
-    : {};
+  const predictions = [];
+  let   skipped     = 0;
+  let   fromCache   = 0;
 
   for (const g of newGames) {
-    const cacheKey = `${g.date}|${g.gameId}`;
-    const cached   = predCache[cacheKey];
+    const cached = predCache[`${g.date}|${g.gameId}`];
 
-    // Use the prediction that was actually shown to the user — no reconstruction needed
+    // Use the prediction that was actually shown before the game
     if (cached?.homeProb != null) {
       predictions.push({ cachedHomeProb: cached.homeProb, game: g });
       fromCache++;
       continue;
     }
 
-    // No cached prediction: rebuild the feature vector as a fallback
-    const homeHistory = history[g.homeTeamId] || [];
-    const awayHistory = history[g.awayTeamId] || [];
-
-    const homeStats = computeTeamStats(homeHistory, g.date);
-    const awayStats = computeTeamStats(awayHistory, g.date);
-    if (!homeStats || !awayStats) { skipped++; continue; }
-
-    const h2hStats = computeH2HStats(homeHistory, g.awayTeamId, g.date);
-
-    const season    = g.date.slice(0, 4);
-    const seasonMap = pitcherStatsBySeason[season];
-    let   pitcherStats   = null;
-    let   hasPitcherData = false;
-
-    if (seasonMap && g.homePitcherId && g.awayPitcherId) {
-      const homeP = seasonMap.get(g.homePitcherId);
-      const awayP = seasonMap.get(g.awayPitcherId);
-      if (homeP && awayP) {
-        pitcherStats   = { home: homeP, away: awayP };
-        hasPitcherData = true;
-        withPitchers++;
-      }
-    }
-
-    const homeCtx = computeScheduleContext(homeHistory, g.date);
-    const awayCtx = computeScheduleContext(awayHistory, g.date);
-    const scheduleContext = { home: homeCtx, away: awayCtx };
-
-    const pitcherGameLogs = new Map((gameLogsRaw[season] ?? []).map(([k, v]) => [k, v]));
-
-    const seasonSplits = splitsBySeason[season] ?? {};
-    const tierOneData = {
-      homePitcherId:    g.homePitcherId,
-      awayPitcherId:    g.awayPitcherId,
-      pitcherGameLogs,
-      homeHistory,
-      awayHistory,
-      bullpenByGame,
-      date:             g.date,
-      umpireId:         g.umpireId ?? null,
-      umpireStats:      umpireHistory,
-      homeSplits:       seasonSplits[g.homeTeamId] ?? null,
-      awaySplits:       seasonSplits[g.awayTeamId] ?? null,
-      weather:          weatherByGame[g.gameId] ?? null,
-      awayTeamId:       g.awayTeamId,
-      bullpenERAByTeam: bullpenERABySeason[season] ?? null,
-    };
-
-    const features = buildFeatureVector(
-      homeStats, awayStats, h2hStats, g.homeTeamId,
-      pitcherStats, scheduleContext, tierOneData, normStats
-    );
-
-    predictions.push({ cachedHomeProb: null, features, game: g, hasPitcherData });
+    // No pre-game prediction recorded: rebuild it as a fallback
+    const built = buildGameFeatures(g, featureCtx);
+    if (!built) { skipped++; continue; }
+    predictions.push({ cachedHomeProb: null, features: built.features, game: g });
   }
 
-  console.log(`   ${predictions.length} predictions (${fromCache} from cache, ${withPitchers} rebuilt with pitcher data, ${skipped} skipped)\n`);
+  console.log(`   ${predictions.length} predictions (${fromCache} pre-game, ${predictions.length - fromCache} rebuilt, ${skipped} skipped)\n`);
 
   if (predictions.length === 0) {
     console.log('ℹ️   No usable examples from new games.\n');
     return;
   }
 
-  // ── 6. Load model and run predictions BEFORE training ──────────────────
-  
-
+  // ── 5. Load model and run predictions BEFORE training ──────────────────
   if (!payload.model) throw new Error('No valid model found in model.json — try retraining.');
   const featureNames = payload.featureNames;
 
@@ -280,6 +177,7 @@ async function update() {
       actualHome:    game.homeWin,
       homeProb:      Math.round(homeProb * 1000) / 1000,
       correct:       wasCorrect,
+      pregame:       p.cachedHomeProb != null,
     });
   }
 
@@ -303,7 +201,7 @@ async function update() {
   console.log(`${divider}`);
   console.log(`  Batch accuracy: ${correct}/${predictions.length} = ${(batchAccuracy * 100).toFixed(1)}%\n`);
 
-  // ── 7. Append to accuracy log ──────────────────────────────────────────
+  // ── 6. Append to accuracy log ──────────────────────────────────────────
   const existingLog = fs.existsSync(LOG_PATH)
     ? JSON.parse(fs.readFileSync(LOG_PATH, 'utf8'))
     : [];
@@ -311,33 +209,11 @@ async function update() {
   const updatedLog = [...existingLog, ...logEntries];
   fs.writeFileSync(LOG_PATH, JSON.stringify(updatedLog, null, 2));
 
-  // ── 8. Append new games to cache ──────────────────────────────────────
+  // ── 7. Append new games to cache ──────────────────────────────────────
   fs.writeFileSync(DATA_PATH, JSON.stringify(allGames));
   console.log(`\n💾  Cache: ${existingGames.length} → ${allGames.length} games`);
 
-  // ── 9. Refresh pitcher stats, game logs & bullpen (after accuracy is locked) ──
-  for (const season of newSeasons) {
-    console.log(`🔄  Refreshing pitcher stats for ${season}…`);
-    pitcherStatsBySeason[season] = await fetchSeasonPitcherStats(season);
-  }
-  const serialisable = {};
-  for (const [season, map] of Object.entries(pitcherStatsBySeason)) {
-    serialisable[season] = [...map.entries()];
-  }
-  fs.writeFileSync(STATS_PATH, JSON.stringify(serialisable));
-
-  for (const season of newSeasons) {
-    const raw        = fs.existsSync(GAMELOGS_PATH) ? JSON.parse(fs.readFileSync(GAMELOGS_PATH, 'utf8')) : {};
-    const pitcherIds = [...new Set(
-      allGames.filter(g => g.date.startsWith(season))
-              .flatMap(g => [g.homePitcherId, g.awayPitcherId].filter(Boolean))
-    )];
-    const logs = await fetchPitcherGameLogs(pitcherIds, season);
-    raw[season] = [...logs.entries()];
-    fs.writeFileSync(GAMELOGS_PATH, JSON.stringify(raw));
-    console.log(`   Game logs refreshed for ${season}: ${logs.size} pitchers`);
-  }
-
+  // ── 8. Bullpen pitch counts for the new games ─────────────────────────
   const newGameIds = newGames.map(g => g.gameId);
   if (newGameIds.length > 0) {
     const existing   = fs.existsSync(BULLPEN_PATH) ? JSON.parse(fs.readFileSync(BULLPEN_PATH, 'utf8')) : {};
@@ -347,8 +223,12 @@ async function update() {
     console.log(`   Bullpen data updated: ${newBullpen.size} new games`);
   }
 
-  // ── 10. Full retrain on all data ──────────────────────────────────────
-  const seasons = payload.trainedOn ?? [2024, 2025, 2026];
+  // ── 9. Full retrain on all data ──────────────────────────────────────
+  // Include any new season that's appeared in the data (e.g. opening day 2027)
+  const seasons = [...new Set([
+    ...(payload.trainedOn ?? []),
+    ...allGames.map(g => Number(g.date.slice(0, 4))),
+  ])].sort();
   console.log(`🌲  Triggering full retrain on ${allGames.length} games…`);
   await train({ seasons, fresh: false });
 
@@ -358,7 +238,7 @@ async function update() {
   fs.writeFileSync(MODEL_PATH, JSON.stringify(updatedModel));
   console.log(`✅  Model retrained through ${today}\n`);
 
-  // ── 11. Print running accuracy summary ────────────────────────────────
+  // ── 10. Print running accuracy summary ────────────────────────────────
   printAccuracySummary(updatedLog);
 }
 
@@ -429,7 +309,7 @@ async function fetchRangeWithPitchers(startDate, endDate) {
   const url =
     `${BASE_URL}/schedule?sportId=1` +
     `&startDate=${startDate}&endDate=${endDate}` +
-    `&hydrate=linescore,team,probablePitcher&gameType=R`;
+    `&hydrate=linescore,team,probablePitcher,officials&gameType=R`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`MLB API error ${res.status}`);
   return res.json();
@@ -458,6 +338,8 @@ function parseCompletedGames(scheduleData) {
         homeWin:       homeScore > awayScore,
         homePitcherId: game.teams.home.probablePitcher?.id ?? null,
         awayPitcherId: game.teams.away.probablePitcher?.id ?? null,
+        umpireId:      (game.officials ?? [])
+          .find(o => (o.officialType || '').toLowerCase().includes('plate'))?.official?.id ?? null,
       });
     }
   }
