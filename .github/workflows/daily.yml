@@ -1,0 +1,99 @@
+name: Daily predictions
+
+# Grades yesterday's games, retrains, predicts today and redeploys the site.
+# Times are UTC: 13:00 = 9 AM Eastern (8 AM in winter), 16:00 = noon,
+# 22:00 = 6 PM — the later runs pick up newly announced starting pitchers
+# before day and night games.
+on:
+  schedule:
+    - cron: '0 13 * * *'
+    - cron: '0 16 * * *'
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'baseball-predictor5/public/**'
+      - 'baseball-predictor5/src/**'
+      - 'baseball-predictor5/scripts/**'
+      - 'baseball-predictor5/index.js'
+      - '.github/workflows/daily.yml'
+
+permissions:
+  contents: write   # commit the updated data/ back to the repo
+  pages: write
+  id-token: write
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: baseball-predictor5
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: baseball-predictor5/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: baseball-predictor5/requirements.txt
+
+      - run: npm ci
+      - run: pip install -r requirements.txt
+
+      # The model isn't committed (it's ~6 MB and changes daily). It's cached
+      # between runs, keyed on the data and code it was trained from; on a
+      # miss the pipeline simply retrains (about two minutes).
+      - name: Restore model
+        uses: actions/cache/restore@v4
+        with:
+          path: baseball-predictor5/data/model.json
+          key: model-${{ hashFiles('baseball-predictor5/data/games.json', 'baseball-predictor5/src/**', 'baseball-predictor5/scripts/train_model.py') }}
+
+      - name: Run pipeline
+        run: node index.js daily
+        env:
+          SCHEDULE_TZ: America/New_York
+
+      - name: Save model
+        uses: actions/cache/save@v4
+        continue-on-error: true   # key already exists when nothing was retrained
+        with:
+          path: baseball-predictor5/data/model.json
+          key: model-${{ hashFiles('baseball-predictor5/data/games.json', 'baseball-predictor5/src/**', 'baseball-predictor5/scripts/train_model.py') }}
+
+      - name: Commit updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "data: pipeline run $(TZ=America/New_York date '+%Y-%m-%d %H:%M %Z')"
+            git pull --rebase
+            git push
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: baseball-predictor5/public
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,7 +1,0 @@
-[build]
-builder = "dockerfile"
-dockerfilePath = "baseball-predictor5/Dockerfile"
-
-[deploy]
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3

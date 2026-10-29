@@ -117,7 +117,7 @@ async function fetchPitcherStatsMap(ids, season) {
  * for every historical game, so it's not a training feature — but it's
  * valuable context to display alongside predictions.
  */
-async function fetchPitcherRecentForm(pitcherIds, season, lastNStarts = 3) {
+async function fetchPitcherRecentForm(pitcherIds, season, beforeDate = '9999-12-31', lastNStarts = 3) {
   if (pitcherIds.length === 0) return {};
 
   const url =
@@ -139,9 +139,10 @@ async function fetchPitcherRecentForm(pitcherIds, season, lastNStarts = 3) {
     const gameLogStats = person.stats
       ?.find(s => s.group?.displayName === 'pitching' && s.type?.displayName === 'gameLog');
 
-    // Filter to starts only (inningsPitched >= 1) and sort most recent first
+    // Starts before the target date only, most recent first
     const starts = (gameLogStats?.splits || [])
-      .filter(s => parseFloat(s.stat?.inningsPitched) >= 1 && s.stat?.gamesStarted >= 1)
+      .filter(s => (s.date ?? '') < beforeDate)
+      .filter(s => (s.stat?.outs ?? 0) >= 3 && s.stat?.gamesStarted >= 1)
       .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
       .slice(0, lastNStarts);
 
@@ -150,15 +151,18 @@ async function fetchPitcherRecentForm(pitcherIds, season, lastNStarts = 3) {
       continue;
     }
 
-    const eras    = starts.map(s => parseFloat(s.stat.era) || 0);
-    const recentEra = mean(eras);
+    // The game log's `era` field is season-to-date, so compute each start's
+    // ERA from its own earned runs and outs.
+    const startEra = s => (s.stat.earnedRuns ?? 0) * 27 / s.stat.outs;
+    const totalER   = starts.reduce((sum, s) => sum + (s.stat.earnedRuns ?? 0), 0);
+    const totalOuts = starts.reduce((sum, s) => sum + s.stat.outs, 0);
+    const recentEra = totalER * 27 / totalOuts;
 
-    // Trend: compare first half vs second half of the window
-    // (oldest start ERA vs newest start ERA for a 3-start sample)
+    // Trend: newest start vs oldest start in the window
     let trend = 'stable';
     if (starts.length >= 2) {
-      const newest = parseFloat(starts[0].stat.era) || 0;  // most recent
-      const oldest = parseFloat(starts[starts.length - 1].stat.era) || 0;
+      const newest = startEra(starts[0]);
+      const oldest = startEra(starts[starts.length - 1]);
       if (newest < oldest - 0.75)      trend = 'improving';  // ERA dropped = better
       else if (newest > oldest + 0.75) trend = 'declining';
     }
@@ -209,10 +213,6 @@ function buildPitcherFeatures(homePitcher, awayPitcher) {
     awayPitcherWHIP:  aWHIP,
     pitcherAdvantage: Math.max(0, Math.min(1, (homeQuality - awayQuality + 1) / 2)),
   };
-}
-
-function mean(arr) {
-  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 }
 
 module.exports = {

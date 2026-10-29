@@ -34,6 +34,35 @@ const ROLLING_WINDOW = 30;
 const H2H_WINDOW = 15;
 const DECAY_LAMBDA = 0.05;
 
+// Human-readable grouping of model features, used for per-game explanations
+// and grouped feature importance on the website.
+const FEATURE_GROUP_MEMBERS = {
+  'Starting pitching': [
+    'homePitcherFIP', 'homePitcherWHIP', 'awayPitcherFIP', 'awayPitcherWHIP', 'pitcherAdvantage',
+    'homeK9', 'awayK9', 'homeBB9', 'awayBB9', 'homeHR9', 'awayHR9',
+    'homeStarterRecentERA', 'awayStarterRecentERA', 'recentFormAdvantage',
+    'homeStarterRestDays', 'awayStarterRestDays', 'homeStarterAnnounced', 'awayStarterAnnounced',
+  ],
+  'Lineup vs. starter hand': ['homeVsHandOPS', 'awayVsHandOPS'],
+  'Bullpen': ['homeBullpenFatigue', 'awayBullpenFatigue', 'homeBullpenERA', 'awayBullpenERA'],
+  'Team form': [
+    'homeWinPct', 'awayWinPct', 'homePythagWinPct', 'awayPythagWinPct',
+    'homeAvgRS', 'awayAvgRS', 'homeAvgRA', 'awayAvgRA', 'homeHomeWinPct', 'awayAwayWinPct',
+    'homeRecentHomePct', 'awayRecentAwayPct', 'winPctDiff', 'runDiffAdv', 'homeMomentum', 'awayMomentum',
+  ],
+  'Head-to-head': ['h2hHomeWinPct', 'h2hRunDiffAdv'],
+  'Schedule & rest': [
+    'homeRestDays', 'awayRestDays', 'homeScheduleDensity', 'awayScheduleDensity',
+    'homeStandLength', 'roadTripLength',
+  ],
+  'Park & weather': ['parkFactor', 'tempFeature', 'windFeature'],
+  'Umpire': ['umpireRunFactor'],
+  'Season timing': ['seasonProgress'],
+};
+const FEATURE_GROUPS = Object.fromEntries(
+  Object.entries(FEATURE_GROUP_MEMBERS).flatMap(([group, names]) => names.map(n => [n, group]))
+);
+
 // Neutral fallback values for new features when data unavailable
 const NEUTRAL_RECENT_ERA = 0.5;
 const NEUTRAL_BULLPEN = 0.5;
@@ -337,9 +366,6 @@ function getUmpireFeature(umpireId, umpireHistory, beforeDate) {
   return Math.max(0, Math.min(1, (avgRuns - 6) / 6));
 }
 
-// Keep old name as alias so server.js import doesn't break
-const buildUmpireStats = buildUmpireHistory;
-
 // ---------------------------------------------------------------------------
 // Feature vector assembly (32 features)
 // ---------------------------------------------------------------------------
@@ -480,12 +506,9 @@ function buildFeatureVector(
   // ── NEW: Weather features ─────────────────────────────────────────────
   const weather = normaliseWeather(tierOneData?.weather ?? null);
 
-  // ── NEW: Bullpen quality ERA ──────────────────────────────────────────
-  const bullpenERAByTeam = tierOneData?.bullpenERAByTeam ?? null;
-  const homeBullpenEraRaw = bullpenERAByTeam?.get(homeTeamId) ?? null;
-  const awayBullpenEraRaw = bullpenERAByTeam?.get(
-    tierOneData?.awayTeamId ?? null
-  ) ?? null;
+  // ── NEW: Bullpen quality ERA (point-in-time, see pointInTime.js) ─────
+  const homeBullpenEraRaw = tierOneData?.homeBullpenERA ?? null;
+  const awayBullpenEraRaw = tierOneData?.awayBullpenERA ?? null;
   // Normalise [2.5, 6.0] → [0,1] inverted (lower ERA = better = higher value)
   const normBullpenERA = era => {
     if (era == null) return 0.5;
@@ -536,82 +559,85 @@ function buildFeatureVector(
 // Training dataset builder
 // ---------------------------------------------------------------------------
 
-function buildTrainingData(
-  games,
-  pitcherStatsBySeason = {},
-  pitcherGameLogsBySeason = {},
-  bullpenByGame = null,
-  splitsBySeason = {},
-  weatherByGame = {},
-  bullpenERABySeason = {},
-) {
+/**
+ * Builds the full feature vector for one game using only information
+ * available before game.date. This is the single code path used by
+ * training, the daily update, the web server and the CLI.
+ *
+ * @param {object} game  { gameId, date, homeTeamId, awayTeamId, homePitcherId, awayPitcherId, umpireId }
+ * @param {object} ctx   { history, umpireHistory, pit, bullpenByGame, weatherByGame, normStats }
+ * @returns {object|null} null if either team lacks enough history
+ */
+function buildGameFeatures(game, ctx) {
+  const { history, umpireHistory, pit, bullpenByGame = null, weatherByGame = {}, normStats = null } = ctx;
+  const { date, homeTeamId, awayTeamId, homePitcherId = null, awayPitcherId = null } = game;
+
+  const homeHistory = history[homeTeamId] || [];
+  const awayHistory = history[awayTeamId] || [];
+  const homeStats = computeTeamStats(homeHistory, date);
+  const awayStats = computeTeamStats(awayHistory, date);
+  if (!homeStats || !awayStats) return null;
+
+  const h2hStats = computeH2HStats(homeHistory, awayTeamId, date);
+  const homeCtx = computeScheduleContext(homeHistory, date);
+  const awayCtx = computeScheduleContext(awayHistory, date);
+
+  const pitcherStats = {
+    home: homePitcherId ? pit.pitcherBefore(homePitcherId, date) : LEAGUE_AVG,
+    away: awayPitcherId ? pit.pitcherBefore(awayPitcherId, date) : LEAGUE_AVG,
+  };
+  const homeTeam = pit.teamBefore(homeTeamId, date);
+  const awayTeam = pit.teamBefore(awayTeamId, date);
+
+  const tierOneData = {
+    homePitcherId,
+    awayPitcherId,
+    pitcherGameLogs: pit.pitcherLogsForSeason(date.slice(0, 4)),
+    homeHistory,
+    awayHistory,
+    bullpenByGame,
+    date,
+    umpireId: game.umpireId ?? null,
+    umpireStats: umpireHistory,
+    homeSplits: homeTeam.splits,
+    awaySplits: awayTeam.splits,
+    weather: weatherByGame[game.gameId] ?? null,
+    awayTeamId,
+    homeBullpenERA: homeTeam.bullpenEra,
+    awayBullpenERA: awayTeam.bullpenEra,
+  };
+
+  const features = buildFeatureVector(
+    homeStats, awayStats, h2hStats, homeTeamId,
+    pitcherStats, { home: homeCtx, away: awayCtx }, tierOneData, normStats
+  );
+
+  return { features, homeStats, awayStats, h2hStats, homeCtx, awayCtx, pitcherStats };
+}
+
+function buildTrainingData(games, { pit, bullpenByGame = null, weatherByGame = {} }) {
   const history = buildTeamHistory(games);
   const umpireHistory = buildUmpireHistory(games);  // indexed by date — no leakage
   const normStats = buildNormStats(games);
   console.log(`   Norm bounds: RS [${normStats.rsLo.toFixed(1)}, ${normStats.rsHi.toFixed(1)}], maxRuns ${normStats.maxRuns.toFixed(1)}`);
+  const ctx = { history, umpireHistory, pit, bullpenByGame, weatherByGame, normStats };
   const trainingData = [];
   let skipped = 0;
   let withPitchers = 0;
 
   for (const g of games) {
-    const homeHistory = history[g.homeTeamId] || [];
-    const awayHistory = history[g.awayTeamId] || [];
+    const built = buildGameFeatures(g, ctx);
+    if (!built) { skipped++; continue; }
 
-    const homeStats = computeTeamStats(homeHistory, g.date);
-    const awayStats = computeTeamStats(awayHistory, g.date);
-    if (!homeStats || !awayStats) { skipped++; continue; }
-
-    const h2hStats = computeH2HStats(homeHistory, g.awayTeamId, g.date);
-    const homeCtx = computeScheduleContext(homeHistory, g.date);
-    const awayCtx = computeScheduleContext(awayHistory, g.date);
-    const scheduleContext = { home: homeCtx, away: awayCtx };
-
-    // Season pitcher stats
-    const season = g.date.slice(0, 4);
-    const seasonMap = pitcherStatsBySeason[season];
-    let pitcherStats = null;
-    let hasPitcherData = false;
-
-    if (seasonMap && g.homePitcherId && g.awayPitcherId) {
-      const homeP = seasonMap.get(g.homePitcherId);
-      const awayP = seasonMap.get(g.awayPitcherId);
-      if (homeP && awayP) {
-        pitcherStats = { home: homeP, away: awayP };
-        hasPitcherData = true;
-        withPitchers++;
-      }
-    }
-
-    // Tier 1 data bundle
-    const gameLogs = pitcherGameLogsBySeason[season] ?? null;
-    const seasonSplits = splitsBySeason[season] ?? {};
-    const tierOneData = {
-      homePitcherId: g.homePitcherId,
-      awayPitcherId: g.awayPitcherId,
-      pitcherGameLogs: gameLogs,
-      homeHistory,
-      awayHistory,
-      bullpenByGame,
-      date: g.date,
-      umpireId: g.umpireId ?? null,
-      umpireStats: umpireHistory,
-      homeSplits: seasonSplits[g.homeTeamId] ?? null,
-      awaySplits: seasonSplits[g.awayTeamId] ?? null,
-      weather: weatherByGame[g.gameId] ?? null,
-      awayTeamId: g.awayTeamId,
-      bullpenERAByTeam: bullpenERABySeason[season] ?? null,
-    };
-
-    const features = buildFeatureVector(
-      homeStats, awayStats, h2hStats, g.homeTeamId,
-      pitcherStats, scheduleContext, tierOneData, normStats
-    );
+    const hasPitcherData = !!(g.homePitcherId && g.awayPitcherId);
+    if (hasPitcherData) withPitchers++;
 
     trainingData.push({
-      input: features,
+      input: built.features,
       output: { homeWin: g.homeWin ? 1 : 0 },
       hasPitcherData,
       date: g.date,   // needed for temporal train/test split
+      gameId: g.gameId,
     });
   }
 
@@ -644,7 +670,8 @@ module.exports = {
   computeScheduleContext,
   buildNormStats,
   buildUmpireHistory,
-  buildUmpireStats,    // alias for buildUmpireHistory
   buildFeatureVector,
+  buildGameFeatures,
+  FEATURE_GROUPS,
   buildTrainingData,
 };

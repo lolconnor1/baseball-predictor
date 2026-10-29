@@ -3,28 +3,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>⚾ Baseball Oracle</title>
+  <title>Baseball Oracle · MLB Game Predictions</title>
+  <meta name="description" content="A machine learning model that predicts every MLB game, retrained and published daily. Point-in-time features, walk-forward validation, calibrated probabilities.">
   <meta name="theme-color" content="#0a0e0f">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Oracle">
-  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚾</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div class="scanlines"></div>
+  <div class="scanlines" aria-hidden="true"></div>
 
   <header>
     <div class="header-inner">
-      <div class="logo">
-        <span class="logo-icon">⚾</span>
-        <div class="logo-text">
+      <a class="logo" href="#today">
+        <span class="logo-icon" aria-hidden="true">⚾</span>
+        <span class="logo-text">
           <span class="logo-title">BASEBALL ORACLE</span>
-          <span class="logo-sub">MLB PREDICTIONS · UPDATES DAILY AT 9:15 AM</span>
-        </div>
-      </div>
+          <span class="logo-sub">MLB GAME PREDICTIONS · RETRAINED DAILY</span>
+        </span>
+      </a>
       <div class="model-status" id="modelStatus">
         <span class="status-dot"></span>
         <span class="status-text">Loading…</span>
@@ -32,160 +31,164 @@
     </div>
   </header>
 
-  <!-- Desktop top tabs (hidden on mobile) -->
-  <nav class="tabs">
-    <button class="tab active" data-tab="predictions">Predictions</button>
-    <button class="tab" data-tab="accuracy">Accuracy Log</button>
-    <button class="tab" data-tab="bets">Bet Tracker</button>
-    <button class="tab" data-tab="model">Oracle</button>
+  <nav class="tabs" aria-label="Sections">
+    <div class="tabs-inner">
+      <a class="tab" href="#today" data-tab="today">Today</a>
+      <a class="tab" href="#record" data-tab="record">Track record</a>
+      <a class="tab" href="#model" data-tab="model">How it works</a>
+    </div>
   </nav>
 
-  <!-- ── PREDICTIONS TAB ── -->
-  <section class="tab-content active" id="tab-predictions">
-    <div class="toolbar">
-      <div class="date-control">
-        <label for="datePicker">DATE</label>
-        <input type="date" id="datePicker">
+  <main>
+    <!-- ── TODAY ── -->
+    <section class="tab-content" id="tab-today" aria-labelledby="todayTitle">
+      <div class="page-head">
+        <h1 id="todayTitle">Today's games</h1>
+        <p id="todaySub" class="page-sub"></p>
       </div>
-      <button class="btn-primary" id="btnPredict">RUN PREDICTIONS</button>
-    </div>
+      <div id="todayGames"><div class="loading">LOADING PREDICTIONS</div></div>
+    </section>
 
-    <div id="predictionsContainer">
-      <div class="empty-state">
-        <div class="empty-icon">⚾</div>
-        <p>Select a date and click RUN PREDICTIONS</p>
+    <!-- ── TRACK RECORD ── -->
+    <section class="tab-content" id="tab-record" aria-labelledby="recordTitle">
+      <div class="page-head">
+        <h1 id="recordTitle">Track record</h1>
+        <p class="page-sub">Every graded prediction. Live predictions are recorded before first pitch and never edited afterwards.</p>
       </div>
-    </div>
-  </section>
 
-  <!-- ── ACCURACY TAB ── -->
-  <section class="tab-content" id="tab-accuracy">
-    <div class="accuracy-header">
-      <div class="stat-cards" id="statCards">
-        <div class="stat-card">
-          <div class="stat-label">ALL-TIME</div>
-          <div class="stat-value" id="statAllTime">—</div>
+      <div class="segmented" role="group" aria-label="Which record to show">
+        <button type="button" data-mode="live" id="modeLive">Live</button>
+        <button type="button" data-mode="backtest" id="modeBacktest">Backtest</button>
+      </div>
+      <p class="note" id="recordNote"></p>
+
+      <div class="kpis" id="recordKpis"></div>
+
+      <div class="panel">
+        <h2>Accuracy over the season</h2>
+        <p class="panel-sub">Running share of games picked correctly, against always picking the home team. Starts once 150 games are in.</p>
+        <div class="chart" id="chartCumulative"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Every prediction</h2>
+        <div class="filters">
+          <label>Team
+            <select id="filterTeam"><option value="">All teams</option></select>
+          </label>
+          <label>Result
+            <select id="filterResult">
+              <option value="">All</option>
+              <option value="correct">Correct</option>
+              <option value="missed">Missed</option>
+            </select>
+          </label>
+          <span class="filter-count" id="filterCount"></span>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">LAST 30 DAYS</div>
-          <div class="stat-value" id="statRecent">—</div>
+        <div class="table-wrap">
+          <table class="log-table" id="recordTable">
+            <thead>
+              <tr><th scope="col">Date</th><th scope="col">Matchup</th><th scope="col">Final</th><th scope="col">Pick</th><th scope="col"><span class="sr-only">Result</span></th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
         </div>
-        <div class="stat-card highlight">
-          <div class="stat-label">HIGH CONFIDENCE (≥65%)</div>
-          <div class="stat-value" id="statConf">—</div>
+        <button type="button" class="btn-secondary" id="showMore" hidden>Show more</button>
+      </div>
+    </section>
+
+    <!-- ── HOW IT WORKS ── -->
+    <section class="tab-content" id="tab-model" aria-labelledby="modelTitle">
+      <div class="page-head">
+        <h1 id="modelTitle">How it works</h1>
+        <p class="page-sub lead">
+          Baseball Oracle predicts the winner of every MLB game. Each morning a scheduled GitHub Actions job pulls the
+          latest results from the MLB Stats API, rebuilds the model's features for every game using only information
+          available before first pitch, retrains a random forest, and publishes the predictions on this site. No
+          server, no manual steps.
+        </p>
+      </div>
+
+      <div class="kpis" id="modelKpis"></div>
+
+      <div class="panel">
+        <h2>The pipeline</h2>
+        <ol class="pipeline">
+          <li><span class="step-n">1</span><div><strong>Collect</strong><p>Every regular-season game since 2021 from the MLB Stats API: results, probable starters, plate umpires, box scores, and per-game logs for every starter and team. Game-day weather from Open-Meteo.</p></div></li>
+          <li><span class="step-n">2</span><div><strong>Build features, as of the day before</strong><p><span id="featureCount">53</span> features per game: starter quality and recent form, lineup strength against the starter's handedness, bullpen quality and workload, team form, rest and travel, park, weather and umpire. Each stat is rebuilt from game logs using only games played before that date, and shrunk toward last season's numbers early in the year.</p></div></li>
+          <li><span class="step-n">3</span><div><strong>Validate walk-forward</strong><p>Each season is predicted by a model trained only on earlier seasons. Random forest and XGBoost are both tried; the one with the lower out-of-sample log loss wins.</p></div></li>
+          <li><span class="step-n">4</span><div><strong>Calibrate</strong><p>Platt scaling, fit on those out-of-sample predictions, turns raw forest scores into probabilities that mean what they say.</p></div></li>
+          <li><span class="step-n">5</span><div><strong>Predict and publish</strong><p>The model is retrained on everything, today's games are scored, and predictions are locked in before first pitch. The site is static: just HTML and JSON files rebuilt by the pipeline.</p></div></li>
+        </ol>
+      </div>
+
+      <div class="panel callout">
+        <h2>The data leak I found</h2>
+        <p>
+          An earlier version of this model scored <strong>60.5%</strong> on its test season. That would beat the betting
+          market, which is a red flag rather than a result. The cause: pitcher, bullpen and batting-split stats were
+          season totals, so a game in April already "knew" how a pitcher would finish in September.
+        </p>
+        <p>
+          Rebuilding every stat as of the day before each game dropped accuracy to <strong id="leakAfter">55.3%</strong>,
+          in line with what the old model had actually done on live games. The lower number is the honest one, and it's
+          the one everything on this site reports.
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>Season by season</h2>
+        <p class="panel-sub">Accuracy when each season is predicted by a model that never saw it, against always picking the home team.</p>
+        <div class="chart" id="chartWalkForward"></div>
+      </div>
+
+      <div class="panel-row">
+        <div class="panel">
+          <h2>Are the probabilities honest?</h2>
+          <p class="panel-sub">Out-of-sample games grouped by predicted home win chance. Points on the diagonal mean "60%" really wins 60% of the time.</p>
+          <div class="chart" id="chartCalibration"></div>
+        </div>
+        <div class="panel">
+          <h2>Confidence pays off</h2>
+          <p class="panel-sub">Accuracy by how confident the pick was, with 95% intervals. Share of games in each band below.</p>
+          <div class="chart" id="chartConfidence"></div>
         </div>
       </div>
-    </div>
-    <div id="accuracyLog">
-      <div class="empty-state">
-        <div class="empty-icon">📊</div>
-        <p>No accuracy data yet — run an update after games finish</p>
-      </div>
-    </div>
-  </section>
 
-  <!-- ── BET TRACKER TAB ── -->
-  <section class="tab-content" id="tab-bets">
-    <div class="bet-stat-cards" id="betStatCards">
-      <div class="bet-stat-card">
-        <div class="stat-label">NET P&amp;L</div>
-        <div class="stat-value" id="betStatPnl">—</div>
+      <div class="panel">
+        <h2>What the model relies on</h2>
+        <p class="panel-sub">Share of the forest's total impurity-based importance, grouped by what the features describe.</p>
+        <div class="chart" id="chartImportance"></div>
       </div>
-      <div class="bet-stat-card">
-        <div class="stat-label">WIN RATE</div>
-        <div class="stat-value" id="betStatWinRate">—</div>
-      </div>
-      <div class="bet-stat-card">
-        <div class="stat-label">TOTAL WAGERED</div>
-        <div class="stat-value" id="betStatWagered">—</div>
-      </div>
-      <div class="bet-stat-card">
-        <div class="stat-label">ROI</div>
-        <div class="stat-value" id="betStatRoi">—</div>
-      </div>
-    </div>
-    <div id="betsLog">
-      <div class="empty-state">
-        <div class="empty-icon">💰</div>
-        <p>No bets logged yet — click LOG BET on any prediction card</p>
-      </div>
-    </div>
-  </section>
 
-  <!-- ── MODEL / ORACLE TAB ── -->
-  <section class="tab-content" id="tab-model">
-    <div class="model-info" id="modelInfo">
-      <div class="empty-state">
-        <div class="empty-icon">🔮</div>
-        <p>Loading model info…</p>
+      <div class="panel">
+        <h2>Built with</h2>
+        <ul class="stack">
+          <li><strong>Data</strong> MLB Stats API · Open-Meteo</li>
+          <li><strong>Features &amp; inference</strong> Node.js</li>
+          <li><strong>Training</strong> Python · scikit-learn · XGBoost</li>
+          <li><strong>Automation</strong> GitHub Actions (scheduled)</li>
+          <li><strong>Hosting</strong> GitHub Pages (static)</li>
+        </ul>
+        <p class="panel-sub">Source code: <a href="https://github.com/lolconnor1/baseball-predictor">github.com/lolconnor1/baseball-predictor</a></p>
       </div>
-    </div>
-  </section>
+    </section>
+  </main>
 
-  <!-- Mobile bottom navigation bar -->
-  <nav class="bottom-nav">
-    <button class="nav-item active" data-tab="predictions">
-      <span class="nav-icon">⚾</span>
-      <span>Predictions</span>
-    </button>
-    <button class="nav-item" data-tab="accuracy">
-      <span class="nav-icon">📊</span>
-      <span>Accuracy</span>
-    </button>
-    <button class="nav-item" data-tab="bets">
-      <span class="nav-icon">💰</span>
-      <span>Bets</span>
-    </button>
-    <button class="nav-item" data-tab="model">
-      <span class="nav-icon">🔮</span>
-      <span>Oracle</span>
-    </button>
+  <footer>
+    <p>Personal project, not affiliated with MLB. Predictions are for fun and education. Data from the MLB Stats API and Open-Meteo.</p>
+  </footer>
+
+  <!-- Mobile bottom navigation -->
+  <nav class="bottom-nav" aria-label="Sections">
+    <a class="nav-item" href="#today" data-tab="today"><span class="nav-icon" aria-hidden="true">⚾</span><span>Today</span></a>
+    <a class="nav-item" href="#record" data-tab="record"><span class="nav-icon" aria-hidden="true">📈</span><span>Record</span></a>
+    <a class="nav-item" href="#model" data-tab="model"><span class="nav-icon" aria-hidden="true">🔬</span><span>How it works</span></a>
   </nav>
 
-  <!-- Bet modal -->
-  <div class="modal-overlay" id="betModal">
-    <div class="modal bet-modal">
-      <div class="modal-title">LOG BET</div>
-      <div class="bet-modal-matchup" id="betModalMatchup"></div>
+  <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
 
-      <div class="bet-team-btns" id="betTeamBtns"></div>
-
-      <div class="bet-form">
-        <div class="bet-form-group">
-          <label class="bet-form-label">ODDS (AMERICAN)</label>
-          <input type="number" id="betOddsInput" class="bet-input" placeholder="-110">
-        </div>
-        <div class="bet-form-group">
-          <label class="bet-form-label">AMOUNT ($)</label>
-          <input type="number" id="betAmountInput" class="bet-input" placeholder="100" min="1" step="1">
-        </div>
-      </div>
-
-      <div class="bet-payout-preview" id="betPayoutPreview"></div>
-
-      <div class="bet-modal-actions">
-        <button class="btn-secondary" id="betCancelBtn">CANCEL</button>
-        <button class="btn-primary" id="betSubmitBtn">LOG BET</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Update modal -->
-  <div class="modal-overlay" id="updateModal">
-    <div class="modal">
-      <div class="modal-title">UPDATING MODEL</div>
-      <div class="modal-spinner">⚙</div>
-      <div class="modal-log" id="updateLog">Fetching new games…</div>
-    </div>
-  </div>
-
+  <script src="charts.js"></script>
   <script src="app.js"></script>
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js').catch(() => {});
-      });
-    }
-  </script>
 </body>
 </html>

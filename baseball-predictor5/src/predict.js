@@ -1,83 +1,64 @@
 'use strict';
 
-const { rfPredict } = require('./rfPredict');
+/**
+ * predict.js — predictions for a date, used by the daily pipeline (which
+ * publishes them to the website) and the CLI (`node index.js predict`).
+ */
+
 const fs   = require('fs');
 const path = require('path');
 
-const { fetchGamesForDate }                              = require('./api');
-const { buildTeamHistory, computeTeamStats,
-        computeH2HStats, computeScheduleContext,
-        buildUmpireStats, buildFeatureVector }           = require('./features');
-const { fetchProbablePitchers, fetchPitcherRecentForm } = require('./pitchers');
-const { getRawParkFactor, getVenueName }                = require('./venues');
+const { rfPredict, rfExplain }                             = require('./rfPredict');
+const { fetchGamesForDate }                                = require('./api');
+const { buildTeamHistory, buildUmpireHistory,
+        buildGameFeatures, FEATURE_GROUPS }                = require('./features');
+const { fetchProbablePitchers, fetchPitcherRecentForm }   = require('./pitchers');
+const { getRawParkFactor, getVenueName, getVenueCoords }  = require('./venues');
+const { fetchGameWeather }                                = require('./weather');
+const { preparePitForDate }                               = require('./pointInTime');
 
-const ROOT          = path.join(__dirname, '..');
-const DATA_PATH     = path.join(ROOT, 'data', 'games.json');
-const MODEL_PATH    = path.join(ROOT, 'data', 'model.json');
-const BULLPEN_PATH  = path.join(ROOT, 'data', 'bullpen.json');
-const GAMELOGS_PATH = path.join(ROOT, 'data', 'pitcher-gamelogs.json');
+const ROOT            = path.join(__dirname, '..');
+const DATA_PATH       = path.join(ROOT, 'data', 'games.json');
+const MODEL_PATH      = path.join(ROOT, 'data', 'model.json');
+const BULLPEN_PATH    = path.join(ROOT, 'data', 'bullpen.json');
+const PRED_CACHE_PATH = path.join(ROOT, 'data', 'prediction-cache.json');
+const PREGAME_STATUSES = new Set(['Scheduled', 'Pre-Game', 'Warmup', 'Delayed Start']);
+const SCHEDULE_TZ     = process.env.SCHEDULE_TZ || 'America/New_York';
 
-async function predict({ date = today() } = {}) {
-  // ── 1. Load model ──────────────────────────────────────────────────
-  if (!fs.existsSync(MODEL_PATH)) {
-    console.error('❌  No trained model found. Run `node index.js train` first.');
-    process.exit(1);
-  }
+// ---------------------------------------------------------------------------
+// Predict logic — returns structured data instead of printing
+// ---------------------------------------------------------------------------
+async function runPredict(date) {
   const payload = JSON.parse(fs.readFileSync(MODEL_PATH, 'utf8'));
 
-  if (!payload.model) throw new Error('No valid model found in model.json');
+  if (!payload.model) throw new Error('No valid model found in model.json — try retraining.');
   const featureNames = payload.featureNames;
+  const calibration  = payload.model.calibration ?? null;
+  const normStats    = payload.normStats ?? null;
 
-  console.log(`\n🤖  Model trained on seasons : ${payload.trainedOn.join(', ')}`);
-  console.log(`    Test accuracy             : ${(payload.testAccuracy * 100).toFixed(1)}%`);
-  console.log(`    Baseline (always home)    : ${(payload.baselineAcc * 100).toFixed(1)}%`);
-  console.log(`    Feature count             : ${payload.featureCount ?? 'legacy'}`);
-  if (payload.lastUpdated) console.log(`    Last updated              : ${payload.lastUpdated}`);
-  console.log();
-
-  // ── 2. Load game history + caches ─────────────────────────────────
-  if (!fs.existsSync(DATA_PATH)) {
-    console.error('❌  No game data found. Run `node index.js train` first.');
-    process.exit(1);
-  }
-  const allGames    = JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
-  const history     = buildTeamHistory(allGames);
+  const allGames      = JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
+  const history       = buildTeamHistory(allGames);
   const umpireHistory = buildUmpireHistory(allGames);
 
-  // Bullpen cache
+  const [games, pitcherMap] = await Promise.all([
+    fetchGamesForDate(date),
+    fetchProbablePitchers(date),
+  ]);
+
+  // Load bullpen cache if available
   let bullpenByGame = null;
   if (fs.existsSync(BULLPEN_PATH)) {
     const raw = JSON.parse(fs.readFileSync(BULLPEN_PATH, 'utf8'));
     bullpenByGame = new Map(Object.entries(raw).map(([k, v]) => [parseInt(k), v]));
   }
 
-  // Pitcher game logs cache
-  let pitcherGameLogsForSeason = null;
-  if (fs.existsSync(GAMELOGS_PATH)) {
-    const raw    = JSON.parse(fs.readFileSync(GAMELOGS_PATH, 'utf8'));
-    const season = date.slice(0, 4);
-    pitcherGameLogsForSeason = new Map((raw[season] ?? []).map(([k, v]) => [k, v]));
-  }
-
-  // ── 3. Fetch schedule + pitcher data ──────────────────────────────
-  console.log(`📡  Fetching games and pitcher data for ${date}…`);
-  const [games, pitcherMap] = await Promise.all([
-    fetchGamesForDate(date),
-    fetchProbablePitchers(date),
-  ]);
-
-  if (games.length === 0) {
-    console.log(`\n⚾  No games found for ${date}.\n`);
-    return;
-  }
-
-  // ── 4. Fetch pitcher IDs + recent form ────────────────────────────
-  const allPitcherIds  = new Set();
-  const pitcherIdsByGame = {};
-
+  // Fetch pitcher IDs for recent form
   const scheduleUrl =
     `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}&hydrate=probablePitcher&gameType=R`;
   const schedResp = await fetch(scheduleUrl).catch(() => null);
+  const pitcherIdsByGame = {};
+  const allPitcherIds = new Set();
+
   if (schedResp?.ok) {
     const schedData = await schedResp.json();
     for (const dateObj of schedData.dates || []) {
@@ -86,115 +67,221 @@ async function predict({ date = today() } = {}) {
           homeId: game.teams?.home?.probablePitcher?.id ?? null,
           awayId: game.teams?.away?.probablePitcher?.id ?? null,
         };
-        if (pitcherIdsByGame[game.gamePk].homeId)
-          allPitcherIds.add(pitcherIdsByGame[game.gamePk].homeId);
-        if (pitcherIdsByGame[game.gamePk].awayId)
-          allPitcherIds.add(pitcherIdsByGame[game.gamePk].awayId);
+        if (pitcherIdsByGame[game.gamePk].homeId) allPitcherIds.add(pitcherIdsByGame[game.gamePk].homeId);
+        if (pitcherIdsByGame[game.gamePk].awayId) allPitcherIds.add(pitcherIdsByGame[game.gamePk].awayId);
       }
     }
   }
 
   const season     = date.slice(0, 4);
   const recentForm = allPitcherIds.size > 0
-    ? await fetchPitcherRecentForm([...allPitcherIds], season)
+    ? await fetchPitcherRecentForm([...allPitcherIds], season, date)
     : {};
 
-  // ── 5. Build predictions ───────────────────────────────────────────
-  const divider = '─'.repeat(70);
-  const normStats = payload.normStats ?? null;
+  // Point-in-time pitcher / bullpen / split stats — same code path as training
+  const teamIds = [...new Set(games.flatMap(g => [g.homeTeamId, g.awayTeamId]))];
+  const pit     = await preparePitForDate(date, [...allPitcherIds], teamIds);
 
+  // Fetch weather for today's games (per venue/date, in-memory cache in weather.js)
+  const gameWeatherMap = {};
+  await Promise.all(games.map(async g => {
+    const coords = getVenueCoords(g.homeTeamId);
+    if (!coords) return;
+    const w = await fetchGameWeather(coords.lat, coords.lon, date, g.homeTeamId).catch(() => null);
+    if (w) gameWeatherMap[g.gameId] = w;
+  }));
+
+  const featureCtx = {
+    history, umpireHistory, pit, bullpenByGame, weatherByGame: gameWeatherMap, normStats,
+  };
+
+  const results = [];
+
+  for (const game of games) {
+    const { homeTeamName, awayTeamName, homeTeamId, awayTeamId, status, gameId, gameDate } = game;
+    const ids = pitcherIdsByGame[gameId] ?? {};
+    const base = { gameId, gameDate, homeTeamName, awayTeamName, homeTeamId, awayTeamId, status };
+
+    const built = buildGameFeatures(
+      { ...game, homePitcherId: ids.homeId ?? null, awayPitcherId: ids.awayId ?? null },
+      featureCtx
+    );
+    if (!built) {
+      results.push({ ...base, insufficient: true });
+      continue;
+    }
+    const { features, homeStats, awayStats, h2hStats, homeCtx, awayCtx } = built;
+    const pitcherStats = pitcherMap[gameId] ?? null;   // display only (name, season ERA/WHIP)
+
+    const rawProb  = rfPredict(payload.model, featureNames, features);
+    const homeProb = applyCalibration(rawProb, calibration);
+
+    results.push({
+      ...base,
+      rawProb:       round(rawProb, 3),
+      homeProb:      round(homeProb, 3),
+      awayProb:      round(1 - homeProb, 3),
+      calibrated:    calibration != null,
+      predictedWinner: homeProb >= 0.5 ? homeTeamName : awayTeamName,
+      predictedHome:   homeProb >= 0.5,
+      factors:       explainFactors(payload.model, featureNames, features, homeProb, calibration),
+      venueName:     getVenueName(homeTeamId),
+      parkFactor:    getRawParkFactor(homeTeamId),
+      homePitcher:   pitcherStats?.home ?? null,
+      awayPitcher:   pitcherStats?.away ?? null,
+      homeForm:      ids.homeId ? recentForm[ids.homeId] : null,
+      awayForm:      ids.awayId ? recentForm[ids.awayId] : null,
+      h2h: {
+        homeWinPct: h2hStats.h2hHomeWinPct,
+        runDiffAdv: h2hStats.h2hRunDiffAdv,
+        hasHistory: !(h2hStats.h2hHomeWinPct === 0.5 && h2hStats.h2hRunDiffAdv === 0.5),
+      },
+      schedule: {
+        homeRestDays:    Math.round(homeCtx.restDays * 5),
+        awayRestDays:    Math.round(awayCtx.restDays * 5),
+        homeGames7:      Math.round(homeCtx.scheduleDensity * 7),
+        awayGames7:      Math.round(awayCtx.scheduleDensity * 7),
+        homeStandLength: Math.round(homeCtx.homeStandLength * 7),
+        roadTripLength:  Math.round(awayCtx.roadTripLength  * 7),
+      },
+      homeStats: {
+        winPct:   round(homeStats.winPct, 3),
+        avgRS:    round(homeStats.avgRS, 1),
+        avgRA:    round(homeStats.avgRA, 1),
+        momentum: round(homeStats.momentum, 3),
+      },
+      awayStats: {
+        winPct:   round(awayStats.winPct, 3),
+        avgRS:    round(awayStats.avgRS, 1),
+        avgRA:    round(awayStats.avgRA, 1),
+        momentum: round(awayStats.momentum, 3),
+      },
+    });
+  }
+
+  // Persist pre-game predictions so update can grade the exact probabilities
+  // that were shown. Only games that haven't started are recorded (the latest
+  // pre-game run wins); a run after first pitch never overwrites it.
+  const predCache = fs.existsSync(PRED_CACHE_PATH)
+    ? JSON.parse(fs.readFileSync(PRED_CACHE_PATH, 'utf8'))
+    : {};
+  const predictedAt = new Date().toISOString();
+  let cachedCount = 0;
+  for (const r of results) {
+    if (r.insufficient || !PREGAME_STATUSES.has(r.status)) continue;
+    predCache[`${date}|${r.gameId}`] = {
+      homeProb:      r.homeProb,
+      rawProb:       r.rawProb,
+      predictedHome: r.predictedHome,
+      predictedAt,
+    };
+    cachedCount++;
+  }
+  if (cachedCount > 0) fs.writeFileSync(PRED_CACHE_PATH, JSON.stringify(predCache));
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Platt scaling calibration
+// ---------------------------------------------------------------------------
+function applyCalibration(rawProb, cal) {
+  if (!cal) return rawProb;
+  return 1 / (1 + Math.exp(-(cal.a * rawProb + cal.b)));
+}
+
+/**
+ * Per-game explanation: each feature's contribution to the raw forest
+ * probability (tree-path attribution), summed into readable groups and scaled
+ * by the calibration curve's local slope so they read in percentage points of
+ * the displayed home win probability. Positive = favours the home team.
+ */
+function explainFactors(model, featureNames, features, homeProb, cal) {
+  const explained = rfExplain(model, featureNames, features);
+  if (!explained) return null;
+
+  const slope = cal ? cal.a * homeProb * (1 - homeProb) : 1;
+  const byGroup = {};
+  featureNames.forEach((name, i) => {
+    const group = FEATURE_GROUPS[name] ?? 'Other';
+    byGroup[group] = (byGroup[group] ?? 0) + explained.contributions[i] * slope;
+  });
+
+  return Object.entries(byGroup)
+    .map(([group, value]) => ({ group, value: round(value, 4) }))
+    .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
+}
+
+// Today's date in the schedule timezone (CI runners use UTC, which rolls over
+// to tomorrow during evening games in the US)
+function localToday() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: SCHEDULE_TZ });
+}
+
+function round(v, digits) {
+  const f = 10 ** digits;
+  return Math.round(v * f) / f;
+}
+
+// ---------------------------------------------------------------------------
+// CLI output
+// ---------------------------------------------------------------------------
+
+async function predict({ date = localToday() } = {}) {
+  if (!fs.existsSync(MODEL_PATH) || !fs.existsSync(DATA_PATH)) {
+    console.error('❌  No trained model or game data found. Run `node index.js train` first.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const payload = JSON.parse(fs.readFileSync(MODEL_PATH, 'utf8'));
+  console.log(`\n🤖  Model trained on seasons : ${payload.trainedOn.join(', ')}`);
+  console.log(`    ${payload.testSeason} accuracy          : ${pct(payload.testAccuracy)}  (walk-forward)`);
+  console.log(`    Baseline (always home)    : ${pct(payload.baselineAcc)}`);
+  if (payload.lastUpdated) console.log(`    Last updated              : ${payload.lastUpdated}`);
+
+  const results = await runPredict(date);
+  if (results.length === 0) {
+    console.log(`\n⚾  No games found for ${date}.\n`);
+    return;
+  }
+
+  const divider = '─'.repeat(70);
   console.log(`\n🎯  MLB Predictions for ${date}`);
   console.log(divider);
 
-  let modelled = 0;
-
-  for (const game of games) {
-    const { homeTeamName, awayTeamName, homeTeamId, awayTeamId, status, gameId } = game;
-
-    const homeHistory = history[homeTeamId] || [];
-    const awayHistory = history[awayTeamId] || [];
-    const homeStats   = computeTeamStats(homeHistory, date);
-    const awayStats   = computeTeamStats(awayHistory, date);
-
-    if (!homeStats || !awayStats) {
-      console.log(`\n  ${awayTeamName} @ ${homeTeamName}  [${status}]`);
+  for (const r of results) {
+    console.log(`\n  ${r.awayTeamName}  @  ${r.homeTeamName}  [${r.status}]`);
+    if (r.insufficient) {
       console.log(`  ⚠️   Not enough historical data to predict.`);
       continue;
     }
 
-    const h2hStats       = computeH2HStats(homeHistory, awayTeamId, date);
-    const homeCtx        = computeScheduleContext(homeHistory, date);
-    const awayCtx        = computeScheduleContext(awayHistory, date);
-    const scheduleContext = { home: homeCtx, away: awayCtx };
-    const pitcherStats   = pitcherMap[gameId] ?? null;
-    const ids            = pitcherIdsByGame[gameId] ?? {};
+    const confidence = r.predictedHome ? r.homeProb : r.awayProb;
+    console.log(`  Venue      : ${r.venueName}  (park factor ${r.parkFactor.toFixed(2)})`);
 
-    const tierOneData = {
-      homePitcherId:   ids.homeId,
-      awayPitcherId:   ids.awayId,
-      pitcherGameLogs: pitcherGameLogsForSeason,
-      homeHistory,
-      awayHistory,
-      bullpenByGame,
-      date,
-      umpireId:        game.umpireId ?? null,
-      umpireStats: umpireHistory,
-    };
-
-    const features = buildFeatureVector(
-      homeStats, awayStats, h2hStats, homeTeamId,
-      pitcherStats, scheduleContext, tierOneData, normStats
-    );
-
-    const homeProb = rfPredict(payload.model, featureNames, features);
-
-    const awayProb     = 1 - homeProb;
-    const favoriteHome = homeProb >= 0.5;
-    const favorite     = favoriteHome ? homeTeamName : awayTeamName;
-    const confidence   = favoriteHome ? homeProb : awayProb;
-
-    const homePitcher = pitcherStats?.home;
-    const awayPitcher = pitcherStats?.away;
-    const homeForm    = ids.homeId ? recentForm[ids.homeId] : null;
-    const awayForm    = ids.awayId ? recentForm[ids.awayId] : null;
-
-    console.log(`\n  ${awayTeamName}  @  ${homeTeamName}  [${status}]`);
-    console.log(`  Venue      : ${getVenueName(homeTeamId)}  (park factor ${getRawParkFactor(homeTeamId).toFixed(2)})`);
-
-    if (homePitcher && !homePitcher.isLeagueAvg) {
-      const hStr = homeForm ? `  recent ${homeForm.recentEra} ERA (${homeForm.trend})` : '';
-      const aStr = awayForm ? `  recent ${awayForm.recentEra} ERA (${awayForm.trend})` : '';
-      console.log(`  Pitchers   : ${homePitcher.name} ERA ${homePitcher.era?.toFixed(2)} WHIP ${homePitcher.whip?.toFixed(2)}${hStr}`);
-      console.log(`               ${awayPitcher.name} ERA ${awayPitcher.era?.toFixed(2)} WHIP ${awayPitcher.whip?.toFixed(2)}${aStr} (away)`);
+    const hp = r.homePitcher, ap = r.awayPitcher;
+    if (hp && !hp.isLeagueAvg && ap) {
+      const form = f => f ? `  recent ${f.recentEra} ERA (${f.trend})` : '';
+      console.log(`  Pitchers   : ${hp.name} ERA ${hp.era?.toFixed(2)} WHIP ${hp.whip?.toFixed(2)}${form(r.homeForm)}`);
+      console.log(`               ${ap.name} ERA ${ap.era?.toFixed(2)} WHIP ${ap.whip?.toFixed(2)}${form(r.awayForm)} (away)`);
     } else {
       console.log(`  Pitchers   : Not yet announced`);
     }
 
-    const h2hLabel = h2hStats.h2hHomeWinPct === 0.5 && h2hStats.h2hRunDiffAdv === 0.5
-      ? 'Insufficient history'
-      : `Home wins ${pct(h2hStats.h2hHomeWinPct)} of prior matchups`;
-    console.log(`  H2H        : ${h2hLabel}`);
-
-    const homeRest   = Math.round(homeCtx.restDays * 5);
-    const awayRest   = Math.round(awayCtx.restDays * 5);
-    const homeGames7 = Math.round(homeCtx.scheduleDensity * 7);
-    const awayGames7 = Math.round(awayCtx.scheduleDensity * 7);
-    const homeStand  = Math.round(homeCtx.homeStandLength * 7);
-    const roadTrip   = Math.round(awayCtx.roadTripLength  * 7);
-    console.log(`  Schedule   : Home — ${homeRest}d rest, ${homeGames7}/7 days, game ${homeStand} of home stand`);
-    console.log(`               Away — ${awayRest}d rest, ${awayGames7}/7 days, game ${roadTrip} of road trip`);
-
-    console.log(`  Prediction : ${BOLD}${favorite}${RESET} wins`);
-    console.log(`  Confidence : ${confidenceBar(confidence)} ${pct(confidence)}`);
-    console.log(`  Win probs  : home ${pct(homeProb)}  |  away ${pct(awayProb)}`);
-    console.log(`  Home stats : WR ${pct(homeStats.winPct)}, RS ${homeStats.avgRS.toFixed(1)}, RA ${homeStats.avgRA.toFixed(1)}, last-5 ${pct(homeStats.momentum)}`);
-    console.log(`  Away stats : WR ${pct(awayStats.winPct)}, RS ${awayStats.avgRS.toFixed(1)}, RA ${awayStats.avgRA.toFixed(1)}, last-5 ${pct(awayStats.momentum)}`);
-
-    modelled++;
+    console.log(`  Prediction : ${BOLD}${r.predictedWinner}${RESET} wins`);
+    console.log(`  Confidence : ${confidenceBar(confidence)} ${pct(confidence)}${r.calibrated ? '  (calibrated)' : ''}`);
+    console.log(`  Win probs  : home ${pct(r.homeProb)}  |  away ${pct(r.awayProb)}`);
+    if (r.factors) {
+      const top = r.factors.slice(0, 3).map(f =>
+        `${f.group} ${f.value >= 0 ? '+' : '−'}${Math.abs(f.value * 100).toFixed(1)} → ${f.value >= 0 ? 'home' : 'away'}`);
+      console.log(`  Key factors: ${top.join('  ·  ')}`);
+    }
   }
 
+  const modelled = results.filter(r => !r.insufficient).length;
   console.log(`\n${divider}`);
-  console.log(`  ${modelled} of ${games.length} matchup(s) predicted\n`);
+  console.log(`  ${modelled} of ${results.length} matchup(s) predicted\n`);
 }
 
 const BOLD  = '\x1b[1m';
@@ -207,9 +294,4 @@ function confidenceBar(c) {
   return `[${'█'.repeat(f)}${'░'.repeat(20 - f)}]`;
 }
 
-function today() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
-
-module.exports = { predict };
+module.exports = { runPredict, predict, localToday, applyCalibration };
