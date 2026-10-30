@@ -7,6 +7,11 @@
 
 const MLB_API   = 'https://statsapi.mlb.com/api/v1';
 const PAGE_SIZE = 50;
+const MODEL_INFO = {
+  'logistic-regression':   { name: 'logistic regression', importance: "Share of the model's total weight (coefficients on standardized inputs), grouped by what the features describe." },
+  'sklearn-random-forest': { name: 'random forest', importance: "Share of the forest's total impurity-based importance, grouped by what the features describe." },
+  'xgboost':               { name: 'XGBoost', importance: "Share of the model's total impurity-based importance, grouped by what the features describe." },
+};
 const C = { mark: Charts.css('--mark'), muted: Charts.css('--mark-muted') };
 
 const state = { today: null, record: null, model: null, backtest: null, rendered: new Set() };
@@ -363,10 +368,12 @@ function drawTable(rows) {
 
 async function renderModel() {
   state.model ??= await getJson('data/model.json');
-  const { model, walkForward, pooled, latestSeason, importance } = state.model;
+  const { model, walkForward, pooled, importance } = state.model;
 
   document.getElementById('featureCount').textContent = model.featureCount;
-  if (latestSeason) document.getElementById('leakAfter').textContent = pct(latestSeason.accuracy);
+  const modelInfo = MODEL_INFO[model.type] ?? MODEL_INFO['sklearn-random-forest'];
+  document.getElementById('modelWinner').textContent = modelInfo.name;
+  document.getElementById('importanceSub').textContent = modelInfo.importance;
 
   const first = walkForward[0]?.season, last = walkForward[walkForward.length - 1]?.season;
   document.getElementById('modelKpis').replaceChildren(
@@ -374,7 +381,7 @@ async function renderModel() {
       { label: `Accuracy, ${first}–${last}`, value: pct(pooled.accuracy), detail: `${nf(pooled.n)} out-of-sample games`, highlight: true },
       { label: 'Lift over home team', value: pts(pooled.liftVsHome.value), detail: `95% CI ${pts(pooled.liftVsHome.ci[0])} to ${pts(pooled.liftVsHome.ci[1])}` },
       { label: 'Log loss', value: pooled.logLoss.toFixed(4), detail: `base rate ${pooled.baseRateLogLoss.toFixed(4)} · coin flip 0.6931` },
-      { label: 'Training data', value: nf(model.totalGames), detail: `games, ${model.seasons[0]}–${model.seasons[model.seasons.length - 1]} · ${model.trees} trees` },
+      { label: 'Training data', value: nf(model.totalGames), detail: `games, ${model.seasons[0]}–${model.seasons[model.seasons.length - 1]} · ${modelInfo.name}${model.trees ? `, ${model.trees} trees` : ''}` },
     ].map(t => h('div', { class: `kpi${t.highlight ? ' highlight' : ''}` },
       h('div', { class: 'kpi-label' }, t.label),
       h('div', { class: 'kpi-value' }, t.value),

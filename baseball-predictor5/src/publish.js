@@ -27,14 +27,16 @@ const PRED_CACHE_PATH = path.join(DATA, 'prediction-cache.json');
 const PREGAME_STATUSES = new Set(['Scheduled', 'Pre-Game', 'Warmup', 'Delayed Start']);
 
 const FEATURE_LABELS = {
-  pitcherAdvantage: 'Starting pitcher edge (FIP + WHIP)',
-  recentFormAdvantage: 'Starter recent-form edge',
-  homeStarterRecentERA: 'Home starter recent ERA', awayStarterRecentERA: 'Away starter recent ERA',
-  homePitcherFIP: 'Home starter FIP', awayPitcherFIP: 'Away starter FIP',
-  homePitcherWHIP: 'Home starter WHIP', awayPitcherWHIP: 'Away starter WHIP',
-  homeK9: 'Home starter K/9', awayK9: 'Away starter K/9',
-  homeBB9: 'Home starter BB/9', awayBB9: 'Away starter BB/9',
-  homeHR9: 'Home starter HR/9', awayHR9: 'Away starter HR/9',
+  homeStarterKPct: 'Home starter K% (projected)', awayStarterKPct: 'Away starter K% (projected)',
+  homeStarterBBPct: 'Home starter BB% (projected)', awayStarterBBPct: 'Away starter BB% (projected)',
+  homeStarterHRPct: 'Home starter HR% (projected)', awayStarterHRPct: 'Away starter HR% (projected)',
+  homeStarterKBB: 'Home starter K−BB% (projected)', awayStarterKBB: 'Away starter K−BB% (projected)',
+  homeStarterFIP: 'Home starter FIP (projected)', awayStarterFIP: 'Away starter FIP (projected)',
+  homeStarterERA: 'Home starter ERA (projected)', awayStarterERA: 'Away starter ERA (projected)',
+  homeStarterWHIP: 'Home starter WHIP (projected)', awayStarterWHIP: 'Away starter WHIP (projected)',
+  homeStarterExperience: 'Home starter MLB experience', awayStarterExperience: 'Away starter MLB experience',
+  homeStarterExpectedIP: 'Home starter expected innings', awayStarterExpectedIP: 'Away starter expected innings',
+  homeStaffRA: 'Home starter + bullpen runs allowed', awayStaffRA: 'Away starter + bullpen runs allowed',
   homeVsHandOPS: 'Home lineup OPS vs. starter hand', awayVsHandOPS: 'Away lineup OPS vs. starter hand',
   homeBullpenERA: 'Home bullpen ERA', awayBullpenERA: 'Away bullpen ERA',
   homeBullpenFatigue: 'Home bullpen workload (3 days)', awayBullpenFatigue: 'Away bullpen workload (3 days)',
@@ -104,7 +106,7 @@ async function publish({ date, predictions = [] } = {}) {
     generatedAt,
     model: {
       type:         payload.modelType,
-      trees:        payload.model.trees.length,
+      trees:        payload.model.trees?.length ?? null,
       featureCount: payload.featureCount,
       seasons:      payload.trainedOn,
       totalGames:   payload.totalGames,

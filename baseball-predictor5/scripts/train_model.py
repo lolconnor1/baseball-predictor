@@ -1,23 +1,31 @@
 """
-Train a Random Forest and XGBoost on pre-built feature vectors, keep the better one.
+Train a logistic regression, a Random Forest and XGBoost on pre-built feature
+vectors, keep the best one.
 
 Usage:
   python train_model.py <input.json> <output.json>
 
 Input JSON:
-  { "X": [[float,...],...], "y": [0|1,...], "dates": ["YYYY-MM-DD",...] }
+  { "X": [[float,...],...], "y": [0|1,...], "dates": ["YYYY-MM-DD",...],
+    "names": [str,...],
+    "terms": [{"home": str, "away": str} | {"feature": str}, ...] }
+
+The logistic model sees home-minus-away differences (the "terms"); the tree
+models see the raw features.
 
 Validation is walk-forward by season: each season is predicted by a model
 trained only on earlier seasons. Those out-of-fold (OOF) predictions are used
-to (a) pick RF vs XGBoost by log loss and (b) fit the Platt calibration, so
+to (a) pick the model by log loss and (b) fit the Platt calibration, so
 the calibration never sees probabilities from a model that trained on the
 same games. The final model is then retrained on everything.
 
 Output JSON:
   {
-    "type":              "xgboost" | "sklearn-rf",
-    "trees":             [...],        # array of exported trees
+    "type":              "logistic" | "xgboost" | "sklearn-rf",
+    "trees":             [...],        # tree models only
     "baseScore":         float,        # XGBoost only — log-odds bias term
+    "terms", "weights", "means", "bias"  # logistic only:
+                         #   logit = bias + sum(weights[j] * (term_j - means[j]))
     "nClasses":          2,
     "testAccuracy":      float,        # last season, walk-forward
     "testLogLoss":       float,
@@ -34,6 +42,7 @@ import json
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
 
@@ -105,6 +114,53 @@ MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "12"))
 N_JOBS    = int(os.environ.get("N_JOBS",    "-1"))
 SKIP_XGB  = os.environ.get("SKIP_XGB", "").lower() in ("1", "true", "yes")
 SKIP_CV   = os.environ.get("SKIP_CV",  "").lower() in ("1", "true", "yes")
+# Strong L2 regularization: single games are mostly noise, and a walk-forward
+# sweep (C from 0.0003 to 1) put the best log loss at C = 0.001–0.003.
+LOGISTIC_C = float(os.environ.get("LOGISTIC_C", "0.003"))
+
+
+class TermLogistic:
+    """Standardized L2 logistic regression on home-minus-away differences.
+
+    Takes the raw feature matrix and builds its own inputs from `terms`, so it
+    drops into walk_forward() next to the tree models.
+    """
+    def __init__(self, terms, names):
+        idx = {n: i for i, n in enumerate(names)}
+        self.terms = terms
+        self.cols = [(idx[t["home"]], idx[t["away"]]) if "home" in t else (idx[t["feature"]], None)
+                     for t in terms]
+
+    def transform(self, X):
+        return np.column_stack([X[:, h] - X[:, a] if a is not None else X[:, h] for h, a in self.cols])
+
+    def fit(self, X, y):
+        T = self.transform(X)
+        self.scaler = StandardScaler().fit(T)
+        self.clf = LogisticRegression(C=LOGISTIC_C, max_iter=5000).fit(self.scaler.transform(T), y)
+        return self
+
+    def predict_proba(self, X):
+        return self.clf.predict_proba(self.scaler.transform(self.transform(X)))
+
+    def export(self):
+        # logit = intercept + sum(coef_j * (t_j - mean_j) / scale_j)
+        return {
+            "terms":   self.terms,
+            "weights": (self.clf.coef_[0] / self.scaler.scale_).tolist(),
+            "means":   self.scaler.mean_.tolist(),
+            "bias":    float(self.clf.intercept_[0]),
+        }
+
+    def feature_importances(self, n_features):
+        # Share of total standardized |coefficient|; a pair's share is split
+        # between its home and away feature so feature groups still add up.
+        imp = np.zeros(n_features)
+        w = np.abs(self.clf.coef_[0])
+        for (h, a), wj in zip(self.cols, w):
+            if a is None: imp[h] += wj
+            else: imp[h] += wj / 2; imp[a] += wj / 2
+        return imp / imp.sum()
 
 def make_rf():
     return RandomForestClassifier(
@@ -194,7 +250,8 @@ def main():
     print(f"   Config: {N_TREES} trees, depth {MAX_DEPTH}, skip_xgb={SKIP_XGB}, skip_cv={SKIP_CV}", flush=True)
     print(f"   Walk-forward test seasons: {', '.join(map(str, test_years))}", flush=True)
 
-    candidates = [("RandomForest", make_rf)]
+    names, terms = data["names"], data["terms"]
+    candidates = [("Logistic", lambda: TermLogistic(terms, names)), ("RandomForest", make_rf)]
     if not SKIP_XGB:
         candidates.append(("XGBoost", make_xgb))
 
@@ -224,20 +281,24 @@ def main():
     final = winner["make"]()
     final.fit(X, y)
 
+    importances = (final.feature_importances(X.shape[1]) if winner_name == "Logistic"
+                   else final.feature_importances_)
     common = {
         "nClasses":           2,
         "testAccuracy":       last_stats["accuracy"],
         "testLogLoss":        last_stats["logLoss"],
         "baselineAcc":        last_stats["baseline"],
         "oofLogLoss":         winner["calLL"],
-        "featureImportances": final.feature_importances_.tolist(),
+        "featureImportances": importances.tolist(),
         "walkForwardCV":      winner["stats"],
         "calibration":        {"a": cal_a, "b": cal_b},
         # Raw out-of-fold probability per input row (null where the row was
         # never in a test season). Used for the website's backtest analytics.
         "oof": [round(float(p), 5) if m else None for p, m in zip(winner["oof"], winner["oofMask"])],
     }
-    if winner_name == "XGBoost":
+    if winner_name == "Logistic":
+        result = {"type": "logistic", **final.export(), **common}
+    elif winner_name == "XGBoost":
         raw_dump = final.get_booster().get_dump(dump_format="json")
         result = {
             "type":      "xgboost",

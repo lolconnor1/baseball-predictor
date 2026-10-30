@@ -25,7 +25,7 @@ const program = new Command();
 
 program
   .name('baseball-predictor')
-  .description('⚾  MLB game outcome predictor — point-in-time features, walk-forward validated random forest')
+  .description('⚾  MLB game outcome predictor — point-in-time features, walk-forward validated and calibrated')
   .version('3.0.0');
 
 // ── train ────────────────────────────────────────────────────────────────────
