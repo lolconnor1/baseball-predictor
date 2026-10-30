@@ -1,33 +1,17 @@
 'use strict';
 
 /**
- * features.js  (v5 — umpire tendencies, bullpen fatigue, pitcher recent form)
+ * features.js — the per-game feature vector, built using only information
+ * available before first pitch. buildGameFeatures() is the single code path
+ * for training, grading and live prediction.
  *
- * Feature vector: 32 inputs (was 26)
- *
- *  ── Team rolling stats (exp. weighted, last 30 games) ───────────── 0–11
- *  ── Head-to-head ────────────────────────────────────────────────── 12–13
- *  ── Ballpark ────────────────────────────────────────────────────── 14
- *  ── Starting pitchers (season ERA/WHIP) ─────────────────────────── 15–19
- *  ── Schedule context ────────────────────────────────────────────── 20–25
- *
- *  ── NEW: Pitcher recent form (last 3 starts) ─────────────────────── 26–28
- *  26  homeStarterRecentERA   normalised & inverted
- *  27  awayStarterRecentERA
- *  28  recentFormAdvantage    composite home-pitcher recent quality vs away
- *
- *  ── NEW: Bullpen fatigue ─────────────────────────────────────────── 29–30
- *  29  homeBullpenFatigue     relief pitches in last 3 days / 120
- *  30  awayBullpenFatigue
- *
- *  ── NEW: Umpire run factor ───────────────────────────────────────── 31
- *  31  umpireRunFactor        umpire's historical runs/game vs league avg
+ * Groups (see FEATURE_GROUP_MEMBERS): starting pitcher projections, lineup
+ * vs. the starter's hand, bullpen quality and workload, team form,
+ * head-to-head, schedule and rest, park and weather, umpire, season timing.
  */
 
 const { getParkFactor } = require('./venues');
 const { normaliseWeather } = require('./weather');
-const { buildPitcherFeatures, LEAGUE_AVG,
-  normaliseERA, normaliseFIP } = require('./pitchers');
 const { normaliseOPS } = require('./splits');
 
 const ROLLING_WINDOW = 30;
@@ -38,9 +22,9 @@ const DECAY_LAMBDA = 0.05;
 // and grouped feature importance on the website.
 const FEATURE_GROUP_MEMBERS = {
   'Starting pitching': [
-    'homePitcherFIP', 'homePitcherWHIP', 'awayPitcherFIP', 'awayPitcherWHIP', 'pitcherAdvantage',
-    'homeK9', 'awayK9', 'homeBB9', 'awayBB9', 'homeHR9', 'awayHR9',
-    'homeStarterRecentERA', 'awayStarterRecentERA', 'recentFormAdvantage',
+    ...['KPct', 'BBPct', 'HRPct', 'KBB', 'FIP', 'ERA', 'WHIP', 'Experience', 'ExpectedIP']
+      .flatMap(s => [`homeStarter${s}`, `awayStarter${s}`]),
+    'homeStaffRA', 'awayStaffRA',
     'homeStarterRestDays', 'awayStarterRestDays', 'homeStarterAnnounced', 'awayStarterAnnounced',
   ],
   'Lineup vs. starter hand': ['homeVsHandOPS', 'awayVsHandOPS'],
@@ -63,8 +47,35 @@ const FEATURE_GROUPS = Object.fromEntries(
   Object.entries(FEATURE_GROUP_MEMBERS).flatMap(([group, names]) => names.map(n => [n, group]))
 );
 
+// Home/away pairs whose names don't follow the homeX / awayX pattern
+const MIRRORED_PAIRS = {
+  homeHomeWinPct: 'awayAwayWinPct',
+  homeRecentHomePct: 'awayRecentAwayPct',
+  homeStandLength: 'roadTripLength',
+};
+
+/**
+ * Inputs for the logistic model: one home-minus-away difference per paired
+ * feature, plus every unpaired feature as-is (already-relative ones such as
+ * winPctDiff, and game-level ones such as parkFactor).
+ * @returns {Array<{home: string, away: string} | {feature: string}>}
+ */
+function buildModelTerms(featureNames) {
+  const names = new Set(featureNames);
+  const paired = new Set();
+  const terms = [];
+  for (const n of featureNames) {
+    const away = MIRRORED_PAIRS[n] ?? (n.startsWith('home') ? `away${n.slice(4)}` : null);
+    if (away && names.has(away)) {
+      terms.push({ home: n, away });
+      paired.add(n).add(away);
+    }
+  }
+  for (const n of featureNames) if (!paired.has(n)) terms.push({ feature: n });
+  return terms;
+}
+
 // Neutral fallback values for new features when data unavailable
-const NEUTRAL_RECENT_ERA = 0.5;
 const NEUTRAL_BULLPEN = 0.5;
 const NEUTRAL_UMPIRE = 0.5;
 
@@ -238,42 +249,6 @@ function computeScheduleContext(teamGames, beforeDate) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// NEW: Pitcher recent form (last 3 starts)
-// ---------------------------------------------------------------------------
-
-/**
- * Looks up a pitcher's recent ERA from the game logs map.
- * Returns normalised [0,1] value (inverted — higher = better pitcher).
- * Falls back to NEUTRAL if no data.
- */
-/**
- * Returns a pitcher's recent ERA using only starts BEFORE beforeDate.
- * The game log cache stores all starts for the full season — we must
- * filter to prevent data leakage from future starts.
- */
-function getRecentERAFeature(pitcherId, pitcherGameLogs, beforeDate, lastN = 3) {
-  if (!pitcherId || !pitcherGameLogs) return NEUTRAL_RECENT_ERA;
-  const log = pitcherGameLogs.get(pitcherId);
-  if (!log || !log.startDates) return NEUTRAL_RECENT_ERA;
-
-  // log.startDates is an array of { date, earnedRuns, inningsPitched }
-  // Filter to starts strictly before the game date, then take last N
-  const priorStarts = (log.startDates ?? [])
-    .filter(s => s.date < beforeDate)
-    .slice(-lastN);
-
-  if (priorStarts.length === 0) return NEUTRAL_RECENT_ERA;
-
-  const totalER = priorStarts.reduce((s, x) => s + (x.earnedRuns ?? 0), 0);
-  const totalIP = priorStarts.reduce((s, x) => s + (x.ip ?? 0), 0);
-
-  if (totalIP < 1) return NEUTRAL_RECENT_ERA;
-
-  const recentEra = (totalER / totalIP) * 9;
-  return normaliseERA(recentEra);
-}
-
 /**
  * Returns normalised days-since-last-start for a pitcher [0,1].
  * Clamp range [4,10] days — typical rotation window.
@@ -371,7 +346,7 @@ function getUmpireFeature(umpireId, umpireHistory, beforeDate) {
 // ---------------------------------------------------------------------------
 
 function buildFeatureVector(
-  homeStats, awayStats, h2hStats, homeTeamId, pitcherStats = null,
+  homeStats, awayStats, h2hStats, homeTeamId, starters = null,
   scheduleContext = null, tierOneData = null, normStats = null
 ) {
   const clamp = (v, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -413,10 +388,29 @@ function buildFeatureVector(
   // ── Ballpark ──────────────────────────────────────────────────────────
   const ballpark = { parkFactor: clamp(getParkFactor(homeTeamId)) };
 
-  // ── Season pitcher stats ──────────────────────────────────────────────
-  const homePitcher = pitcherStats?.home ?? LEAGUE_AVG;
-  const awayPitcher = pitcherStats?.away ?? LEAGUE_AVG;
-  const pitcher = buildPitcherFeatures(homePitcher, awayPitcher);
+  // ── Starting pitchers: Marcel-style projections (see pointInTime.js) ──
+  // Raw values; the models standardise or split on them as they are.
+  // Staff RA blends the starter's projected FIP with the bullpen's ERA by how
+  // deep the starter usually goes.
+  const starterFeatures = (side, p, bullpenEra) => {
+    const ip = Math.min(p.expectedIP, 9);
+    return {
+      [`${side}StarterKPct`]:       p.kPct,
+      [`${side}StarterBBPct`]:      p.bbPct,
+      [`${side}StarterHRPct`]:      p.hrPct,
+      [`${side}StarterKBB`]:        p.kbb,
+      [`${side}StarterFIP`]:        p.fip,
+      [`${side}StarterERA`]:        p.era,
+      [`${side}StarterWHIP`]:       p.whip,
+      [`${side}StarterExperience`]: Math.log1p(p.historyBF),
+      [`${side}StarterExpectedIP`]: p.expectedIP,
+      [`${side}StaffRA`]:           (ip * p.fip + (9 - ip) * (bullpenEra ?? p.fip)) / 9,
+    };
+  };
+  const pitcher = {
+    ...starterFeatures('home', starters.home, tierOneData?.homeBullpenERA),
+    ...starterFeatures('away', starters.away, tierOneData?.awayBullpenERA),
+  };
 
   // ── Schedule context ──────────────────────────────────────────────────
   const hCtx = scheduleContext?.home ?? { restDays: 0.5, scheduleDensity: 0.5, homeStandLength: 0.5, roadTripLength: 0.5 };
@@ -433,30 +427,9 @@ function buildFeatureVector(
   // Shared date for all historical lookups
   const beforeDate = tierOneData?.date ?? '9999-99-99';
 
-  // ── NEW: Recent pitcher form ──────────────────────────────────────────
   const homePitcherId = tierOneData?.homePitcherId ?? null;
   const awayPitcherId = tierOneData?.awayPitcherId ?? null;
   const gameLogs = tierOneData?.pitcherGameLogs ?? null;
-
-  const homeRecentRaw = getRecentERAFeature(homePitcherId, gameLogs, beforeDate);
-  const awayRecentRaw = getRecentERAFeature(awayPitcherId, gameLogs, beforeDate);
-
-  // 70/30 blend: recent ERA (last 3 starts) weighted with season FIP
-  const homeSeasonFIP = normaliseFIP(
-    (pitcherStats?.home?.fip ?? pitcherStats?.home?.era ?? LEAGUE_AVG.fip)
-  );
-  const awaySeasonFIP = normaliseFIP(
-    (pitcherStats?.away?.fip ?? pitcherStats?.away?.era ?? LEAGUE_AVG.fip)
-  );
-  const homeRecentERA = clamp(0.70 * homeRecentRaw + 0.30 * homeSeasonFIP);
-  const awayRecentERA = clamp(0.70 * awayRecentRaw + 0.30 * awaySeasonFIP);
-  const recentAdv = clamp((homeRecentERA - awayRecentERA + 1) / 2);
-
-  const recentForm = {
-    homeStarterRecentERA: homeRecentERA,
-    awayStarterRecentERA: awayRecentERA,
-    recentFormAdvantage: recentAdv,
-  };
 
   // ── NEW: LHP/RHP batting splits ──────────────────────────────────────
   // Home team bats against away pitcher; away team bats against home pitcher.
@@ -532,27 +505,14 @@ function buildFeatureVector(
     umpireRunFactor: clamp(getUmpireFeature(umpireId, umpireStats, beforeDate)),
   };
 
-  // ── NEW: Pitcher component stats (K/9, BB/9, HR/9) ───────────────────
-  const normK9  = v => clamp(normaliseTo01(v ?? 7.5, 4.0, 12.0));
-  const normBB9 = v => clamp(1 - normaliseTo01(v ?? 3.0, 1.0, 5.5)); // inverted: fewer BB = better
-  const normHR9 = v => clamp(1 - normaliseTo01(v ?? 1.1, 0.4, 2.0)); // inverted: fewer HR = better
-  const pitcherComponents = {
-    homeK9:  normK9(pitcherStats?.home?.k9),
-    awayK9:  normK9(pitcherStats?.away?.k9),
-    homeBB9: normBB9(pitcherStats?.home?.bb9),
-    awayBB9: normBB9(pitcherStats?.away?.bb9),
-    homeHR9: normHR9(pitcherStats?.home?.hr9),
-    awayHR9: normHR9(pitcherStats?.away?.hr9),
-  };
-
   // ── NEW: Season progress ──────────────────────────────────────────────
   const gameYear = beforeDate.slice(0, 4);
   const daysSinceOpen = (new Date(beforeDate) - new Date(`${gameYear}-03-20`)) / 86400000;
   const seasonProgress = { seasonProgress: clamp(daysSinceOpen / 200) };
 
-  return { ...base, ...h2h, ...ballpark, ...pitcher, ...schedule, ...splits, ...recentForm,
+  return { ...base, ...h2h, ...ballpark, ...pitcher, ...schedule, ...splits,
            ...starterRest, ...bullpen, ...bullpenQuality, ...weather, ...starterFlags,
-           ...umpire, ...pitcherComponents, ...seasonProgress };
+           ...umpire, ...seasonProgress };
 }
 
 // ---------------------------------------------------------------------------
@@ -582,9 +542,9 @@ function buildGameFeatures(game, ctx) {
   const homeCtx = computeScheduleContext(homeHistory, date);
   const awayCtx = computeScheduleContext(awayHistory, date);
 
-  const pitcherStats = {
-    home: homePitcherId ? pit.pitcherBefore(homePitcherId, date) : LEAGUE_AVG,
-    away: awayPitcherId ? pit.pitcherBefore(awayPitcherId, date) : LEAGUE_AVG,
+  const starters = {
+    home: pit.pitcherProjection(homePitcherId, date),
+    away: pit.pitcherProjection(awayPitcherId, date),
   };
   const homeTeam = pit.teamBefore(homeTeamId, date);
   const awayTeam = pit.teamBefore(awayTeamId, date);
@@ -609,10 +569,10 @@ function buildGameFeatures(game, ctx) {
 
   const features = buildFeatureVector(
     homeStats, awayStats, h2hStats, homeTeamId,
-    pitcherStats, { home: homeCtx, away: awayCtx }, tierOneData, normStats
+    starters, { home: homeCtx, away: awayCtx }, tierOneData, normStats
   );
 
-  return { features, homeStats, awayStats, h2hStats, homeCtx, awayCtx, pitcherStats };
+  return { features, homeStats, awayStats, h2hStats, homeCtx, awayCtx, starters };
 }
 
 function buildTrainingData(games, { pit, bullpenByGame = null, weatherByGame = {} }) {
@@ -673,5 +633,6 @@ module.exports = {
   buildFeatureVector,
   buildGameFeatures,
   FEATURE_GROUPS,
+  buildModelTerms,
   buildTrainingData,
 };

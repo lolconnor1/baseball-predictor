@@ -9,7 +9,8 @@ const { fetchBullpenData }                                      = require('./api
 const { fetchGameWeather }                                      = require('./weather');
 const { getVenueCoords }                                        = require('./venues');
 const { buildTeamHistory, buildUmpireHistory, buildGameFeatures } = require('./features');
-const { loadPitCache, ensureSeasonLogs, buildPitContext }       = require('./pointInTime');
+const { loadPitCache, ensureSeasonLogs, ensurePitcherSeasons,
+        buildPitContext }                                       = require('./pointInTime');
 
 const ROOT             = path.join(__dirname, '..');
 const DATA_PATH        = path.join(ROOT, 'data', 'games.json');
@@ -112,7 +113,7 @@ async function update() {
   if (needsRebuild) {
     const pitCache = loadPitCache();
     await ensureSeasonLogs(pitCache, allGames, newSeasons);
-    pit = buildPitContext(pitCache);
+    pit = buildPitContext(pitCache, await ensurePitcherSeasons(newSeasons));
   }
   const featureCtx = { history, umpireHistory, pit, bullpenByGame, weatherByGame, normStats };
 

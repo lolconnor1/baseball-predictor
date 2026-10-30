@@ -1,17 +1,18 @@
 'use strict';
 
 /**
- * pitchers.js  (v3 — adds recent form via game log)
+ * pitchers.js — starter info shown on the game cards (display only; the
+ * model's pitcher features come from pointInTime.js)
  *
- * fetchProbablePitchers: gets season ERA/WHIP for each starter (used in model)
- * fetchPitcherRecentForm: gets last-3-start ERA for each starter (display only)
+ * fetchProbablePitchers: name and season ERA/WHIP for each probable starter
+ * fetchPitcherRecentForm: last-3-start ERA for each starter
  */
 
 const BASE_URL   = 'https://statsapi.mlb.com/api/v1';
 const LEAGUE_AVG = { era: 4.20, whip: 1.28, fip: 4.20 };
 
 // ---------------------------------------------------------------------------
-// Season stats (used as model features)
+// Season stats
 // ---------------------------------------------------------------------------
 
 async function fetchProbablePitchers(date) {
@@ -178,49 +179,7 @@ async function fetchPitcherRecentForm(pitcherIds, season, beforeDate = '9999-12-
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// Normalise and build pitcher model features
-// ---------------------------------------------------------------------------
-
-function normaliseERA(era) {
-  const clamped = Math.max(1.5, Math.min(7.0, era));
-  return 1 - (clamped - 1.5) / (7.0 - 1.5);
-}
-
-function normaliseFIP(fip) {
-  const clamped = Math.max(1.5, Math.min(7.0, fip));
-  return 1 - (clamped - 1.5) / (7.0 - 1.5);
-}
-
-function normaliseWHIP(whip) {
-  const clamped = Math.max(0.85, Math.min(1.80, whip));
-  return 1 - (clamped - 0.85) / (1.80 - 0.85);
-}
-
-function buildPitcherFeatures(homePitcher, awayPitcher) {
-  const hFIP  = normaliseFIP(homePitcher.fip ?? homePitcher.era ?? LEAGUE_AVG.fip);
-  const hWHIP = normaliseWHIP(homePitcher.whip);
-  const aFIP  = normaliseFIP(awayPitcher.fip ?? awayPitcher.era ?? LEAGUE_AVG.fip);
-  const aWHIP = normaliseWHIP(awayPitcher.whip);
-
-  const homeQuality = 0.6 * hFIP + 0.4 * hWHIP;
-  const awayQuality = 0.6 * aFIP + 0.4 * aWHIP;
-
-  return {
-    homePitcherFIP:   hFIP,
-    homePitcherWHIP:  hWHIP,
-    awayPitcherFIP:   aFIP,
-    awayPitcherWHIP:  aWHIP,
-    pitcherAdvantage: Math.max(0, Math.min(1, (homeQuality - awayQuality + 1) / 2)),
-  };
-}
-
 module.exports = {
   fetchProbablePitchers,
   fetchPitcherRecentForm,
-  buildPitcherFeatures,
-  normaliseERA,
-  normaliseFIP,
-  normaliseWHIP,
-  LEAGUE_AVG,
 };

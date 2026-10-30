@@ -83,61 +83,31 @@ async function fetchHistoricalGames(season) {
 // Pitcher season stats
 // ---------------------------------------------------------------------------
 
-async function fetchSeasonPitcherStats(season) {
-  console.log(`   Fetching ${season} pitcher season stats…`);
-
-  const statsMap = new Map();
+/**
+ * Full-season pitching counting stats for every pitcher in a season.
+ * Returns Map<pitcherId, [outs, h, er, bb, hbp, k, hr, gs, g, age]>
+ */
+async function fetchSeasonPitcherCounts(season) {
+  const counts = new Map();
   const pageSize = 500;
-  let   offset   = 0;
-  let   total    = null;
-
-  while (true) {
+  for (let offset = 0; ; offset += pageSize) {
     const url =
       `${BASE_URL}/stats?stats=season&group=pitching&season=${season}` +
       `&sportId=1&playerPool=all&limit=${pageSize}&offset=${offset}`;
-
-    let data;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
-    } catch (err) {
-      console.warn(`   ⚠️  Could not fetch pitcher stats (offset ${offset}) for ${season}: ${err.message}`);
-      break;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${season} pitcher stats`);
+    const stats = (await res.json()).stats?.[0];
+    for (const { player, stat: s } of stats?.splits ?? []) {
+      if (!player?.id || !s) continue;
+      counts.set(player.id, [
+        s.outs ?? 0, s.hits ?? 0, s.earnedRuns ?? 0, s.baseOnBalls ?? 0, s.hitByPitch ?? 0,
+        s.strikeOuts ?? 0, s.homeRuns ?? 0, s.gamesStarted ?? 0, s.gamesPitched ?? 0, s.age ?? null,
+      ]);
     }
-
-    const splits = data.stats?.[0]?.splits ?? [];
-    if (total === null) total = data.stats?.[0]?.totalSplits ?? splits.length;
-
-    for (const entry of splits) {
-      const id   = entry.player?.id;
-      const stat = entry.stat;
-      if (!id || !stat) continue;
-
-      const era  = parseFloat(stat.era);
-      const whip = parseFloat(stat.whip);
-      const ip   = parseFloat(stat.inningsPitched) || 0;
-      const hr   = parseInt(stat.homeRuns)  || 0;
-      const bb   = parseInt(stat.baseOnBalls) || 0;
-      const hbp  = parseInt(stat.hitByPitch) || 0;
-      const k    = parseInt(stat.strikeOuts) || 0;
-      const fip  = ip >= 20 ? (13 * hr + 3 * (bb + hbp) - 2 * k) / ip + 3.10 : era;
-
-      if (!isNaN(era) && !isNaN(whip) && ip >= 1) {
-        const k9  = ip >= 10 ? (k  / ip) * 9 : null;
-        const bb9 = ip >= 10 ? (bb / ip) * 9 : null;
-        const hr9 = ip >= 10 ? (hr / ip) * 9 : null;
-        statsMap.set(id, { era, whip, ip, fip, k9, bb9, hr9 });
-      }
-    }
-
-    offset += pageSize;
-    if (splits.length < pageSize || offset >= total) break;
+    if (offset + pageSize >= (stats?.totalSplits ?? 0)) break;
     await sleep(200);
   }
-
-  console.log(`   → ${statsMap.size} pitchers loaded for ${season}`);
-  return statsMap;
+  return counts;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +215,6 @@ function sleep(ms) {
 module.exports = {
   fetchHistoricalGames,
   fetchGamesForDate,
-  fetchSeasonPitcherStats,
+  fetchSeasonPitcherCounts,
   fetchBullpenData,
 };

@@ -6,10 +6,10 @@ const path = require('path');
 
 const { fetchHistoricalGames, fetchBullpenData } = require('./api');
 const { loadPitCache, ensureSeasonLogs,
-        ensurePitcherPriors, buildPitContext }    = require('./pointInTime');
+        ensurePitcherSeasons, buildPitContext }   = require('./pointInTime');
 const { fetchGameWeather }                        = require('./weather');
 const { getVenueCoords }                          = require('./venues');
-const { buildTrainingData }                       = require('./features');
+const { buildTrainingData, buildModelTerms }      = require('./features');
 
 const ROOT         = path.join(__dirname, '..');
 const DATA_PATH    = path.join(ROOT, 'data', 'games.json');
@@ -59,8 +59,7 @@ async function train({ seasons = [2021, 2022, 2023, 2024, 2025, 2026], fresh = f
   console.log('📦  Loading point-in-time game logs…');
   const pitCache = loadPitCache();
   await ensureSeasonLogs(pitCache, allGames, [Math.min(...seasons) - 1, ...seasons]);
-  const priors = await ensurePitcherPriors(seasons);
-  const pit    = buildPitContext(pitCache, priors);
+  const pit    = buildPitContext(pitCache, await ensurePitcherSeasons(seasons));
   console.log(`   Seasons cached: ${Object.keys(pitCache.seasons).sort().join(', ')}
 `);
 
@@ -173,11 +172,14 @@ async function train({ seasons = [2021, 2022, 2023, 2024, 2025, 2026], fresh = f
   const TMP_OUT = path.join(ROOT, 'data', '_train_output.json');
 
   const allDates = sortedData.map(e => e.date);
-  fs.writeFileSync(TMP_IN, JSON.stringify({ X: allRows, y: allY, dates: allDates }));
+  fs.writeFileSync(TMP_IN, JSON.stringify({
+    X: allRows, y: allY, dates: allDates,
+    names: featureNames, terms: buildModelTerms(featureNames),
+  }));
 
-  // ── 11. Spawn Python trainer (RF vs XGBoost, walk-forward CV)
+  // ── 11. Spawn Python trainer (logistic vs RF vs XGBoost, walk-forward CV)
   const PYTHON_SCRIPT = path.join(ROOT, 'scripts', 'train_model.py');
-  console.log('🐍  Spawning Python trainer (RF vs XGBoost, walk-forward)…');
+  console.log('🐍  Spawning Python trainer (logistic vs RF vs XGBoost, walk-forward)…');
 
   const pythonCmd = process.env.PYTHON_CMD ?? (process.platform === 'win32' ? 'python' : 'python3');
   const result = spawnSync(pythonCmd, [PYTHON_SCRIPT, TMP_IN, TMP_OUT], {
@@ -202,7 +204,8 @@ async function train({ seasons = [2021, 2022, 2023, 2024, 2025, 2026], fresh = f
   const testAccuracy = pyOut.testAccuracy;
   const homeWinRate  = pyOut.baselineAcc;
 
-  const modelType = pyOut.type === 'xgboost' ? 'xgboost' : 'sklearn-random-forest';
+  const modelType = { logistic: 'logistic-regression', xgboost: 'xgboost' }[pyOut.type]
+    ?? 'sklearn-random-forest';
 
   console.log(`📊  Model type     : ${modelType}`);
   console.log(`    ${lastSeason} accuracy  : ${(testAccuracy * 100).toFixed(1)}%  (log loss ${pyOut.testLogLoss?.toFixed(4)}, coin flip 0.6931)`);

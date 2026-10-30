@@ -191,16 +191,21 @@ function applyCalibration(rawProb, cal) {
 }
 
 /**
- * Per-game explanation: each feature's contribution to the raw forest
- * probability (tree-path attribution), summed into readable groups and scaled
- * by the calibration curve's local slope so they read in percentage points of
- * the displayed home win probability. Positive = favours the home team.
+ * Per-game explanation: each feature's contribution to the raw model output
+ * (see rfExplain), summed into readable groups and scaled by the local slope
+ * from that output to the displayed, calibrated home win probability, so they
+ * read in percentage points. Positive = favours the home team.
  */
 function explainFactors(model, featureNames, features, homeProb, cal) {
   const explained = rfExplain(model, featureNames, features);
   if (!explained) return null;
 
-  const slope = cal ? cal.a * homeProb * (1 - homeProb) : 1;
+  let slope = cal ? cal.a * homeProb * (1 - homeProb) : 1;
+  if (explained.link === 'logit') {
+    // log-odds → raw probability, before the calibration step
+    const rawProb = 1 / (1 + Math.exp(-explained.contributions.reduce((s, c) => s + c, explained.bias)));
+    slope *= rawProb * (1 - rawProb);
+  }
   const byGroup = {};
   featureNames.forEach((name, i) => {
     const group = FEATURE_GROUPS[name] ?? 'Other';

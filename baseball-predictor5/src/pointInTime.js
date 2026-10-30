@@ -4,8 +4,8 @@
  * pointInTime.js — leak-free pitcher, bullpen and batting-split stats
  *
  * Every stat here is computed from per-game logs using only games played
- * strictly BEFORE the target date, then shrunk toward a prior (last season's
- * final numbers, themselves shrunk toward league average). Training and live
+ * strictly BEFORE the target date, then shrunk toward a prior (earlier
+ * seasons, themselves shrunk toward league average). Training and live
  * prediction both go through this module, so a feature means the same thing
  * in both places.
  *
@@ -16,32 +16,39 @@
  *     teamPitching: { teamId: [[date, gamePk, outs, er], ...] },
  *     teamHitting:  { teamId: [[date, gamePk, oppId, ab, h, bb, hbp, sf, tb], ...] },
  *   }
- * Priors: data/pitcher-priors.json — full-season pitcher stats by season
- *   { season: { fetchedAt, stats: [[id, { era, whip, ip, fip, k9, bb9, hr9 }], ...] } }
+ * Pitcher history: data/pitcher-seasons.json — full-season counting stats
+ *   { season: { fetchedAt, stats: [[id, [outs, h, er, bb, hbp, k, hr, gs, g, age]], ...] } }
  */
 
 const fs   = require('fs');
 const path = require('path');
-const { fetchSeasonPitcherStats } = require('./api');
+const { fetchSeasonPitcherCounts } = require('./api');
 
-const BASE_URL    = 'https://statsapi.mlb.com/api/v1';
-const ROOT        = path.join(__dirname, '..');
-const CACHE_PATH  = path.join(ROOT, 'data', 'pit-logs.json');
-const PRIORS_PATH = path.join(ROOT, 'data', 'pitcher-priors.json');
+const BASE_URL             = 'https://statsapi.mlb.com/api/v1';
+const ROOT                 = path.join(__dirname, '..');
+const CACHE_PATH           = path.join(ROOT, 'data', 'pit-logs.json');
+const PITCHER_SEASONS_PATH = path.join(ROOT, 'data', 'pitcher-seasons.json');
 
-const LEAGUE = {
-  era: 4.20, whip: 1.28, fip: 4.20, k9: 8.5, bb9: 3.2, hr9: 1.2,
-  bullpenEra: 4.10, obp: 0.315, slg: 0.405,
-};
-const FIP_CONST = 3.10;
+const LEAGUE = { bullpenEra: 4.10, obp: 0.315, slg: 0.405 };
 
 // Shrinkage weights (in innings / plate appearances of "prior" evidence)
-const PITCHER_PRIOR_IP     = 20;   // prior-season line → league
-const PITCHER_BLEND_BASE   = 15;   // current-season line → prior (min weight)
 const BULLPEN_PRIOR_IP     = 100;
 const BULLPEN_BLEND_IP     = 50;
 const SPLIT_PRIOR_PA       = 300;
 const SPLIT_BLEND_PA       = 250;
+
+// Marcel-style starter projection (pitcherProjection)
+const PROJECTION = {
+  // Current season to date, then one, two and three seasons back
+  seasonWeights: [1.0, 0.6, 0.4, 0.2],
+  // Regression toward league average, in weighted batters faced: strikeout
+  // rate becomes reliable quickly, hits and runs allowed barely do
+  regressBF: { k: 150, bb: 300, hr: 1000, h: 1500, er: 1500, outs: 1500 },
+  // Starter length: current-season starts count fully, last season's half,
+  // shrunk toward the league average start by this many starts
+  prevSeasonStartWeight: 0.5,
+  regressStarts: 4,
+};
 
 // ---------------------------------------------------------------------------
 // Cache I/O
@@ -57,9 +64,9 @@ function savePitCache(cache) {
   fs.writeFileSync(CACHE_PATH, JSON.stringify(cache));
 }
 
-function loadPriors() {
-  if (!fs.existsSync(PRIORS_PATH)) return {};
-  return JSON.parse(fs.readFileSync(PRIORS_PATH, 'utf8'));
+function loadPitcherSeasons() {
+  if (!fs.existsSync(PITCHER_SEASONS_PATH)) return {};
+  return JSON.parse(fs.readFileSync(PITCHER_SEASONS_PATH, 'utf8'));
 }
 
 // A season's cache is only final if it was fetched after that season ended.
@@ -224,27 +231,29 @@ async function preparePitForDate(date, pitcherIds, teamIds) {
   const teamsRefreshed = !complete && await refreshTeamsIfStale(cache, season, teamIds);
 
   if (toFetch.length > 0 || teamsRefreshed) savePitCache(cache);
-  return buildPitContext(cache);
+  return buildPitContext(cache, await ensurePitcherSeasons([season]));
 }
 
 /**
- * Full-season pitcher stats for each prior season (season - 1), used to
- * anchor early-season estimates. Re-fetched until the season is complete.
+ * Full-season counting stats for the three seasons before each season in
+ * `seasons` (the projection's history). Re-fetched until a season is complete.
+ * data/pitcher-seasons.json: { season: { fetchedAt, stats: [[id, [outs, h, er, bb, hbp, k, hr, gs, g, age]], ...] } }
  */
-async function ensurePitcherPriors(seasons) {
-  const priors  = loadPriors();
-  let   changed = false;
+async function ensurePitcherSeasons(seasons) {
+  const data   = loadPitcherSeasons();
+  const needed = [...new Set(seasons.flatMap(s => [1, 2, 3].map(k => String(Number(s) - k))))].sort();
+  let changed  = false;
 
-  for (const season of seasons) {
-    const prior = String(Number(season) - 1);
-    if (isComplete(priors[prior], prior)) continue;
-    const stats = await fetchSeasonPitcherStats(prior);
-    priors[prior] = { fetchedAt: new Date().toISOString(), stats: [...stats.entries()] };
+  for (const season of needed) {
+    if (isComplete(data[season], season)) continue;
+    console.log(`   Fetching ${season} pitcher season totals…`);
+    const counts = await fetchSeasonPitcherCounts(season);
+    data[season] = { fetchedAt: new Date().toISOString(), stats: [...counts.entries()] };
     changed = true;
   }
 
-  if (changed) fs.writeFileSync(PRIORS_PATH, JSON.stringify(priors));
-  return priors;
+  if (changed) fs.writeFileSync(PITCHER_SEASONS_PATH, JSON.stringify(data));
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,17 +264,12 @@ async function ensurePitcherPriors(seasons) {
  * Builds a lookup object over the cached logs. All methods take a date and
  * only use games strictly before it.
  */
-function buildPitContext(cache, priors = loadPriors()) {
-  const priorMaps    = {};   // season → Map<pitcherId, stats>
+function buildPitContext(cache, pitcherSeasons = loadPitcherSeasons()) {
   const starterIndex = {};   // season → Map<"gamePk|teamId", { pitcherId, row }>
   const logMaps      = {};   // season → Map<pitcherId, { pitchHand, startDates }>
   const teamPriors   = {};   // "season|teamId" → { bullpenEra, vsL, vsR }
-
-  function priorMap(season) {
-    const key = String(Number(season) - 1);
-    if (!priorMaps[key]) priorMaps[key] = new Map(priors[key]?.stats ?? []);
-    return priorMaps[key];
-  }
+  const seasonCounts = {};   // season → Map<pitcherId, counts>
+  const leagues      = {};   // season → league rates per batter faced
 
   function starters(season) {
     const key = String(season);
@@ -285,43 +289,97 @@ function buildPitContext(cache, priors = loadPriors()) {
     return cache.seasons[String(season)]?.pitchers?.[pitcherId]?.hand ?? null;
   }
 
-  // ── Starting pitchers ───────────────────────────────────────────────────
+  // ── Starting pitchers: Marcel-style projection ──────────────────────────
+  // Counts are { bf, outs, h, er, bb, k, hr } with bb including HBP and
+  // batters faced approximated as outs + h + bb + hbp, the same way for
+  // full seasons and game logs so rates are comparable.
 
-  function pitcherBefore(pitcherId, date) {
-    const season = date.slice(0, 4);
-    const games  = cache.seasons[season]?.pitchers?.[pitcherId]?.games ?? [];
+  function countsOf(outs, h, er, bb, hbp, k, hr) {
+    return { bf: outs + h + bb + hbp, outs, h, er, bb: bb + hbp, k, hr };
+  }
 
-    let outs = 0, er = 0, h = 0, bb = 0, hbp = 0, k = 0, hr = 0;
-    for (const row of games) {
-      if (row[0] >= date) break;
-      outs += row[4]; er += row[5]; h += row[6]; bb += row[7]; hbp += row[8]; k += row[9]; hr += row[10];
+  function seasonCountsFor(season) {
+    const key = String(season);
+    if (!seasonCounts[key]) {
+      seasonCounts[key] = new Map((pitcherSeasons[key]?.stats ?? []).map(([id, c]) =>
+        [id, countsOf(c[0], c[1], c[2], c[3], c[4], c[5], c[6])]));
     }
-    const ip = outs / 3;
+    return seasonCounts[key];
+  }
 
-    // Prior: last season's line, shrunk toward league average
-    const p   = pitcherId ? priorMap(season).get(pitcherId) : null;
-    const pIP = p ? Math.min(p.ip ?? 0, 150) : 0;
-    const shrink = (v, lg) => (v != null && isFinite(v) ? (v * pIP + lg * PITCHER_PRIOR_IP) / (pIP + PITCHER_PRIOR_IP) : lg);
-    const pr = {
-      era:  shrink(p?.era,  LEAGUE.era),
-      whip: shrink(p?.whip, LEAGUE.whip),
-      fip:  shrink(p?.fip,  LEAGUE.fip),
-      k9:   shrink(p?.k9,   LEAGUE.k9),
-      bb9:  shrink(p?.bb9,  LEAGUE.bb9),
-      hr9:  shrink(p?.hr9,  LEAGUE.hr9),
+  function league(season) {
+    const key = String(season);
+    if (!leagues[key]) {
+      const t = countsOf(0, 0, 0, 0, 0, 0, 0);
+      for (const c of seasonCountsFor(season).values()) for (const f in t) t[f] += c[f];
+      const rate = Object.fromEntries(Object.keys(t).map(f => [f, t[f] / t.bf]));
+
+      // Average start length, from the starters' game logs
+      let starts = 0, startOuts = 0;
+      for (const p of Object.values(cache.seasons[key]?.pitchers ?? {})) {
+        for (const row of p.games) if (row[3] >= 1) { starts++; startOuts += row[4]; }
+      }
+      const ip = t.outs / 3;
+      leagues[key] = t.bf > 0 ? {
+        ...rate,
+        fipConst: (9 * t.er - (13 * t.hr + 3 * t.bb - 2 * t.k)) / ip,
+        outsPerStart: starts > 0 ? startOuts / starts : 16,
+      } : null;
+    }
+    return leagues[key];
+  }
+
+  /**
+   * Projected per-batter rates for a starter as of `date`: the current season
+   * to date plus the three before it, weighted by recency, each rate regressed
+   * toward the previous season's league average by how noisy it is.
+   */
+  function pitcherProjection(pitcherId, date, opts = {}) {
+    // An unannounced starter (null id) projects as a pitcher with no history
+    const P      = { ...PROJECTION, ...opts };
+    const season = Number(date.slice(0, 4));
+    const lg     = league(season - 1) ?? league(season - 2);
+
+    const tot = countsOf(0, 0, 0, 0, 0, 0, 0);
+    let historyBF = 0;
+    const add = (c, w) => {
+      for (const f in tot) tot[f] += w * c[f];
+      historyBF += c.bf;
     };
 
-    // Current season to date, blended with the prior
-    const W = PITCHER_BLEND_BASE + pIP * 0.15;
-    const blend = (num, prRate) => (num + prRate * W) / (ip + W);
+    const logs = cache.seasons[String(season)]?.pitchers?.[pitcherId]?.games ?? [];
+    const now  = countsOf(0, 0, 0, 0, 0, 0, 0);
+    let starts = 0, startOuts = 0;
+    for (const row of logs) {
+      if (row[0] >= date) break;
+      const c = countsOf(row[4], row[6], row[5], row[7], row[8], row[9], row[10]);
+      for (const f in now) now[f] += c[f];
+      if (row[3] >= 1) { starts++; startOuts += row[4]; }
+    }
+    add(now, P.seasonWeights[0]);
+    for (let back = 1; back <= 3; back++) {
+      const c = seasonCountsFor(season - back).get(Number(pitcherId));
+      if (c) add(c, P.seasonWeights[back]);
+    }
+
+    const rate = f => (tot[f] + P.regressBF[f] * lg[f]) / (tot.bf + P.regressBF[f]);
+    const r = { k: rate('k'), bb: rate('bb'), hr: rate('hr'), h: rate('h'), er: rate('er'), outs: rate('outs') };
+    const ipPerBF = r.outs / 3;
+
+    for (const row of cache.seasons[String(season - 1)]?.pitchers?.[pitcherId]?.games ?? []) {
+      if (row[3] >= 1) { starts += P.prevSeasonStartWeight; startOuts += P.prevSeasonStartWeight * row[4]; }
+    }
+
     return {
-      era:  blend(9 * er,      pr.era),
-      whip: blend(h + bb,      pr.whip),
-      k9:   blend(9 * k,       pr.k9),
-      bb9:  blend(9 * bb,      pr.bb9),
-      hr9:  blend(9 * hr,      pr.hr9),
-      fip:  blend(13 * hr + 3 * (bb + hbp) - 2 * k, pr.fip - FIP_CONST) + FIP_CONST,
-      ip,
+      kPct:  r.k,
+      bbPct: r.bb,
+      hrPct: r.hr,
+      kbb:   r.k - r.bb,
+      fip:   (13 * r.hr + 3 * r.bb - 2 * r.k) / ipPerBF + lg.fipConst,
+      era:   9 * r.er / ipPerBF,
+      whip:  (r.h + r.bb) / ipPerBF,
+      historyBF,
+      expectedIP: (startOuts + P.regressStarts * lg.outsPerStart) / (starts + P.regressStarts) / 3,
     };
   }
 
@@ -403,7 +461,7 @@ function buildPitContext(cache, priors = loadPriors()) {
     };
   }
 
-  return { pitcherBefore, pitcherLogsForSeason, teamBefore };
+  return { pitcherProjection, pitcherLogsForSeason, teamBefore };
 }
 
 function emptyBat() {
@@ -426,8 +484,7 @@ module.exports = {
   loadPitCache,
   savePitCache,
   ensureSeasonLogs,
-  ensurePitcherPriors,
+  ensurePitcherSeasons,
   preparePitForDate,
   buildPitContext,
-  LEAGUE,
 };
